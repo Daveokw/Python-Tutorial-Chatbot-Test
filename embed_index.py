@@ -98,24 +98,39 @@ def simple_crawl(start_url, max_pages=500):
     print("Crawl complete. Pages:", len(pages))
     return pages
 
-def chunk_page_text(url, text, min_chunk_chars=120):
+def chunk_page_text(url, text, min_chunk_chars=700, overlap_chars=150):
     """
-    Attempt to split by double-newline sections and headings, keep code blocks intact.
+    Create larger chunks (~min_chunk_chars) with overlap so each chunk has
+    enough context (paragraphs + code examples).
     """
-    chunks = []
+    text = text.strip()
+    if not text:
+        return []
+    # split by paragraphs (double newline)
     blocks = [b.strip() for b in text.split("\n\n") if b.strip()]
+    chunks = []
     cur = ""
     for b in blocks:
-        if len(cur) < min_chunk_chars:
-            cur = (cur + "\n\n" + b).strip()
+        if cur:
+            cand = cur + "\n\n" + b
         else:
-            if len(cur) >= min_chunk_chars:
-                chunks.append({"url": url, "text": cur})
-            cur = b
-    if cur and len(cur) >= min_chunk_chars:
+            cand = b
+        if len(cand) >= min_chunk_chars:
+            # push chunk (keep some overlap)
+            chunks.append({"url": url, "text": cand})
+            # start new cur as last overlap_chars of cand
+            if overlap_chars > 0:
+                cur = cand[-overlap_chars:]
+            else:
+                cur = ""
+        else:
+            cur = cand
+    # final
+    if cur and len(cur) >= 120:
         chunks.append({"url": url, "text": cur})
-    if not chunks and len(text) >= min_chunk_chars:
-        chunks.append({"url": url, "text": text})
+    # safeguard: if still no chunks, add the whole page
+    if not chunks and len(text) >= 120:
+        chunks = [{"url": url, "text": text}]
     return chunks
 
 def build_index(pages, embed_model_name=EMBED_MODEL, batch_size=EMBED_BATCH):
