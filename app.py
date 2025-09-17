@@ -1,5 +1,6 @@
 # app.py
 import os
+import re
 import pickle
 import gdown
 import faiss
@@ -8,7 +9,6 @@ import streamlit as st
 from sentence_transformers import SentenceTransformer
 from transformers import pipeline
 from dotenv import load_dotenv
-import re
 
 # ------------------------
 # Config / env
@@ -16,6 +16,7 @@ import re
 load_dotenv()
 GDRIVE_INDEX_FAISS_ID = os.getenv("GDRIVE_INDEX_FAISS_ID")
 GDRIVE_INDEX_PKL_ID = os.getenv("GDRIVE_INDEX_PKL_ID")
+HF_MODEL = os.getenv("HF_MODEL", "google/flan-t5-base")  # override to "google/flan-t5-small" if limited
 
 DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -34,6 +35,7 @@ def download_from_gdrive_if_missing():
             url = f"https://drive.google.com/uc?id={GDRIVE_INDEX_PKL_ID}"
             gdown.download(url, INDEX_PKL, quiet=True)
     except Exception:
+        # ignore; load_index_and_chunks() will handle missing files
         pass
 
 # ------------------------
@@ -45,13 +47,19 @@ def load_embed_model(name="all-MiniLM-L6-v2"):
 
 @st.cache_resource(show_spinner=False)
 def load_extractive_qa():
-    # Fast extractive QA for per-chunk answers
-    return pipeline("question-answering", model="distilbert-base-cased-distilled-squad")
+    # Fast extractive QA
+    return pipeline("question-answering", model="distilbert-base-cased-distilled-squad", device=-1)
 
 @st.cache_resource(show_spinner=False)
-def load_gen_pipeline():
-    # Generative model to synthesize final answer
-    return pipeline("text2text-generation", model="google/flan-t5-small")
+def load_gen_pipeline(model_name=HF_MODEL):
+    # Load text2text generator; choose device based on availability
+    # Use device=-1 for CPU, 0 for CUDA (if available)
+    try:
+        import torch
+        device = 0 if torch.cuda.is_available() else -1
+    except Exception:
+        device = -1
+    return pipeline("text2text-generation", model=model_name, device=device)
 
 @st.cache_resource(show_spinner=False)
 def load_index_and_chunks():
@@ -66,9 +74,8 @@ def load_index_and_chunks():
         return None, None
 
 # ------------------------
-# Text cleaning & utilities
+# Cleaning & utilities
 # ------------------------
-# common site/menu boilerplate terms to drop
 BOILERPLATE_PATTERNS = [
     r"\bGet Certified\b", r"\bSign In\b", r"\bTryit Editor\b", r"\bSearch\b",
     r"\bSpaces\b", r"\bMenu\b", r"\bAbout\b", r"\bContact\b", r"\bSubscribe\b",
@@ -78,38 +85,32 @@ BOILERPLATE_PATTERNS = [
 BOILERPLATE_RE = re.compile("|".join(BOILERPLATE_PATTERNS), re.IGNORECASE)
 
 def clean_text(s: str) -> str:
-    """Remove obvious navigation/boilerplate and short junk lines."""
     if not s:
         return ""
-    # remove repeated whitespace
     s = re.sub(r"\r\n", "\n", s)
-    # drop lines that look like menus or are extremely short
     lines = []
     for ln in (line.strip() for line in s.splitlines()):
         if not ln:
             continue
-        # drop short lines that are likely nav
+        # drop obvious nav/menu lines
         if len(ln) < 30 and (ln.isupper() or len(ln.split()) <= 3):
             continue
-        # drop lines containing boilerplate keywords
         if BOILERPLATE_RE.search(ln):
             continue
         lines.append(ln)
-    # join and collapse repeated whitespace
     out = "\n".join(lines)
     out = re.sub(r"\n{2,}", "\n\n", out)
     out = re.sub(r"\s{2,}", " ", out)
     return out.strip()
 
 # ------------------------
-# Search & QA flow
+# Search + QA pipeline
 # ------------------------
 embed_model = load_embed_model()
 extractive_qa = load_extractive_qa()
 gen_pipeline = load_gen_pipeline()
 
-def search_index(idx, chunks, question, k=6):
-    """Return list of (chunk_dict, distance) pairs for top-k"""
+def search_index(idx, chunks, question, k=8):
     qv = embed_model.encode([question], convert_to_numpy=True).astype("float32")
     D, I = idx.search(qv, k)
     results = []
@@ -118,23 +119,17 @@ def search_index(idx, chunks, question, k=6):
             results.append((chunks[idx_i], float(dist)))
     return results
 
-def extract_answers_from_hits(hits_with_dist, question, min_score=0.10):
-    """
-    Run extractive QA on each hit. Returns list of dicts:
-    {'answer':..., 'score':..., 'source': url, 'text': cleaned_text, 'dist': ...}
-    Keep only candidates with score >= min_score (or keep top N).
-    """
+def extract_answers_from_hits(hits_with_dist, question, keep_top=6):
     candidates = []
     for h, dist in hits_with_dist:
         text = clean_text(h.get("text",""))
-        if not text or len(text) < 50:
+        if not text or len(text) < 60:
             continue
         try:
             res = extractive_qa(question=question, context=text)
-            # pipeline returns {'score', 'start', 'end', 'answer'}
             score = float(res.get("score", 0.0))
             ans = res.get("answer","").strip()
-            if ans and score >= 0.01:  # keep even low for later filtering
+            if ans:
                 candidates.append({
                     "answer": ans,
                     "score": score,
@@ -144,68 +139,84 @@ def extract_answers_from_hits(hits_with_dist, question, min_score=0.10):
                 })
         except Exception:
             continue
-    # sort by score desc then distance asc
     candidates.sort(key=lambda x: (-x["score"], x["dist"]))
-    # optionally filter by score threshold or keep top 5
-    return candidates[:6]
+    # dedupe
+    unique = []
+    seen = set()
+    for c in candidates:
+        key = c["answer"].lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(c)
+        if len(unique) >= keep_top:
+            break
+    return unique
 
-def synthesize_answer(question, candidates, max_len=180):
+def synthesize_answer_rich(question, candidates, max_len=320):
     """
-    Given candidate extractive answers, produce one fluent answer using generative model.
-    If candidates empty, return None.
+    Build a rich prompt that:
+    - uses candidates as facts
+    - allows safe background facts (creator/release year) for programming languages
+    - asks for structured output (definition, features, use-cases, example)
     """
     if not candidates:
-        return None
+        return None, []
 
-    # Keep the top 3 unique answers (by text)
-    seen = set()
-    top = []
-    for c in candidates:
-        a = c["answer"]
-        if a.lower() in seen: 
+    # Build short facts list from top candidates
+    facts = []
+    sources = []
+    for c in candidates[:4]:
+        a = c["answer"].strip()
+        if len(a) < 8:
             continue
-        seen.add(a.lower())
-        top.append(c)
-        if len(top) >= 3:
-            break
+        facts.append(f"- {a} (source: {c.get('source') or 'site'})")
+        if c.get("source"):
+            sources.append(c.get("source"))
 
-    # Build synthesis prompt: show candidate answers + short sources
-    parts = []
-    for i, c in enumerate(top, start=1):
-        src = c.get("source") or "source"
-        parts.append(f"Candidate {i}: {c['answer']} (source: {src})")
-    candidates_block = "\n".join(parts)
+    if not facts:
+        return None, sources
+
+    facts_block = "\n".join(facts)
 
     prompt = (
-        "You are an assistant that must answer the user's question using ONLY the candidate answers below, "
-        "which were extracted from the website. Combine and rewrite them into one clear, concise, AI-style answer. "
-        "If the candidates contradict each other, synthesize the most likely correct information. "
-        "Do NOT add facts not present in the candidates. If the candidates don't contain an answer, reply: "
+        "You are a helpful assistant. Use ONLY the facts below to produce a friendly, concise, AI-style answer. "
+        "You MAY include a small amount of generally-known safe background facts for programming languages (creator and initial release year) "
+        "if they are common knowledge — but do NOT invent other facts. If the facts below do not answer the question, reply exactly: "
         "\"I couldn't find this in the site data.\".\n\n"
-        f"Question: {question}\n\nCandidates:\n{candidates_block}\n\nAnswer:"
+        "Produce a response structured as:\n"
+        "1) One-line definition/summary.\n"
+        "2) 'What makes it special?' — 3 bullets.\n"
+        "3) 'What can you build?' — 3 bullets.\n"
+        "4) A tiny example code block (if relevant) wrapped in ```python```\n"
+        "5) One encouraging closing sentence.\n\n"
+        f"Question: {question}\n\nFacts (do not invent beyond allowed background facts):\n{facts_block}\n\nAnswer:"
     )
-
     try:
         out = gen_pipeline(prompt, max_length=max_len, do_sample=False)
         text = out[0].get("generated_text","").strip()
-        # Post-clean: if the generator repeated candidate verbatim, condense whitespace
         text = re.sub(r"\s{2,}", " ", text).strip()
-        return text
+        # get top up to 2 unique sources
+        unique_sources = []
+        for s in sources:
+            if s not in unique_sources and len(unique_sources) < 2:
+                unique_sources.append(s)
+        return text, unique_sources
     except Exception:
-        return None
+        return None, []
 
 # ------------------------
-# App UI (minimal)
+# UI (minimal, no download messages)
 # ------------------------
 st.set_page_config(page_title="W3Schools Python Chatbot", layout="centered")
 st.title("🐍 W3Schools Python — Q&A")
 
-# Silent download + load index
+# Ensure index (silent)
 download_from_gdrive_if_missing()
 INDEX, CHUNKS = load_index_and_chunks()
 
 if INDEX is None or CHUNKS is None:
-    st.warning("Index not available. Please upload index files to Google Drive and set GDRIVE_INDEX_FAISS_ID and GDRIVE_INDEX_PKL_ID as secrets, or run the index builder locally.")
+    st.warning("Index not available. Upload index files to Google Drive and set GDRIVE_INDEX_FAISS_ID and GDRIVE_INDEX_PKL_ID as secrets, or run the index builder locally.")
     st.text_input("Ask a question about W3Schools Python (index not loaded):")
     st.stop()
 
@@ -215,23 +226,29 @@ ask = st.button("Ask")
 if ask and query.strip():
     with st.spinner("Thinking..."):
         try:
-            hits = search_index(INDEX, CHUNKS, query, k=8)  # retrieve more to improve candidate pool
-            candidates = extract_answers_from_hits(hits, query, min_score=0.05)
-            # If candidates are empty or low-confidence, we can still attempt to synthesize from raw chunks
-            if not candidates:
-                # fallback: build small context from top hits and run gen directly
-                raw_context = " \n\n ".join([clean_text(h.get("text","")) for h, _ in hits if len(clean_text(h.get("text","")))>50][:4])
-                answer = synthesize_answer(query, [{"answer": raw_context, "score": 0.01, "source": ""}]) if raw_context else None
+            hits = search_index(INDEX, CHUNKS, query, k=10)
+            candidates = extract_answers_from_hits(hits, query, keep_top=8)
+            answer, top_sources = None, []
+            if candidates:
+                answer, top_sources = synthesize_answer_rich(query, candidates, max_len=360)
             else:
-                answer = synthesize_answer(query, candidates)
+                # fallback: raw context from top chunks
+                raw = " \n\n ".join([clean_text(h.get("text","")) for h, _ in hits if len(clean_text(h.get("text","")))>60][:4])
+                if raw:
+                    # create pseudo-candidate so generator has something to work from
+                    pseudo = [{"answer": raw, "score": 0.01, "source": ""}]
+                    answer, top_sources = synthesize_answer_rich(query, pseudo, max_len=360)
             if answer:
-                # if model returns the explicit fallback phrase, show it exactly
                 low = answer.lower()
                 if "couldn't find" in low or "could not find" in low or "i couldn't find" in low:
                     st.info("I couldn't find this in the site data.")
                 else:
                     st.markdown("### 🧠 Answer")
-                    st.write(answer)
+                    st.markdown(answer)
+                    # Compact sources line (optional)
+                    if top_sources:
+                        links = ", ".join(f"[{s}]({s})" for s in top_sources)
+                        st.markdown(f"**Sources:** {links}")
             else:
                 st.info("I couldn't find a confident answer in the indexed content.")
         except Exception:
