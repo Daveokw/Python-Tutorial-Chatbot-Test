@@ -4,157 +4,156 @@ import pickle
 import requests
 from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
+import trafilatura
 from sentence_transformers import SentenceTransformer
-import faiss
 import numpy as np
+import faiss
+from tqdm import tqdm
 
+ROOT = "https://www.w3schools.com/python/"
 DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
 INDEX_FAISS = os.path.join(DATA_DIR, "index.faiss")
 INDEX_PKL = os.path.join(DATA_DIR, "index.pkl")
-CHUNKS_PICKLE = os.path.join(DATA_DIR, "chunks.pkl")
+CHUNKS_PKL = os.path.join(DATA_DIR, "chunks.pkl")
 
-W3_PYTHON_ROOT = "https://www.w3schools.com/python/"
+EMBED_MODEL = "all-MiniLM-L6-v2"
+EMBED_BATCH = 32
+MAX_PAGES = 800
+CRAWL_DELAY = 0.12
+USER_AGENT = "site-qa-bot/1.0"
 
-def extract_text(html: str) -> str:
-    soup = BeautifulSoup(html, "html.parser")
-    for s in soup(["script","style","noscript","iframe"]):
-        s.decompose()
-    for sel in ("header","footer","nav","aside"):
-        for el in soup.select(sel):
-            el.decompose()
-    text = soup.get_text(separator="\n")
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    return "\n".join(lines)
-
-def fetch_sitemap_urls(sitemap_url):
+def fetch_url(url, session=None, timeout=15):
+    s = session or requests.Session()
     try:
-        r = requests.get(sitemap_url, timeout=20)
+        r = s.get(url, timeout=timeout, headers={"User-Agent": USER_AGENT})
         r.raise_for_status()
+        return r.text
     except Exception:
-        return []
-    soup = BeautifulSoup(r.content, "xml")
-    return [loc.text.strip() for loc in soup.find_all("loc")]
+        return None
 
-def simple_crawl_python(start_url: str, max_pages: int = 500):
+def extract_main_with_trafilatura(html, url):
+    try:
+        main = trafilatura.extract(html, output_format="text")
+    except Exception:
+        main = None
+    soup = BeautifulSoup(html, "html.parser")
+    code_blocks = []
+    for pre in soup.find_all("pre"):
+        txt = pre.get_text().strip()
+        if txt:
+            code_blocks.append("```\n" + txt + "\n```")
+    headings = []
+    for h in soup.find_all(["h1","h2","h3"]):
+        headings.append(h.get_text().strip())
+    combined = ""
+    if main and len(main.strip()) > 50:
+        combined = main.strip()
+    else:
+        combined = soup.get_text(separator="\n").strip()
+    if code_blocks:
+        combined += "\n\n" + "\n\n".join(code_blocks)
+    return combined
+
+def clean_url(u):
+    return u.rstrip("/")
+
+def get_links(html, base_url, allowed_prefix):
+    soup = BeautifulSoup(html, "html.parser")
+    links = set()
+    for a in soup.find_all("a", href=True):
+        href = a["href"].split("#")[0]
+        if not href or href.startswith("javascript:"):
+            continue
+        full = urljoin(base_url, href)
+        if full.startswith(allowed_prefix) and (not any(x in full.lower() for x in ["tryit.asp","signup","login","profile","shop","certificate","forum","about","news"])):
+            links.add(clean_url(full))
+    return links
+
+def simple_crawl(start_url, max_pages=500):
+    print("Starting crawl:", start_url)
     session = requests.Session()
     visited = set()
-    to_visit = [start_url.rstrip("/")]
+    to_visit = [clean_url(start_url)]
     pages = []
+    allowed_base = "{uri.scheme}://{uri.netloc}".format(uri=urlparse(start_url)) + "/python"
     while to_visit and len(visited) < max_pages:
         url = to_visit.pop(0)
         if url in visited:
             continue
-        try:
-            r = session.get(url, timeout=15, headers={"User-Agent":"site-qa-bot/1.0"})
-            r.raise_for_status()
-        except Exception:
+        html = fetch_url(url, session=session)
+        if not html:
             visited.add(url)
             continue
-        text = extract_text(r.text)
-        if len(text.strip()) > 120:
+        text = extract_main_with_trafilatura(html, url)
+        if text and len(text.strip()) > 120:
             pages.append({"url": url, "text": text})
+            print("Collected:", url)
         visited.add(url)
-        soup = BeautifulSoup(r.text, "html.parser")
-        for a in soup.find_all("a", href=True):
-            href = a["href"].split('#')[0]
-            if href.startswith("javascript:") or not href:
-                continue
-            full = urljoin(url, href)
-            if full.startswith(W3_PYTHON_ROOT) and full not in visited and full not in to_visit:
-                if not any(x in full.lower() for x in ["tryit.asp","signup","login","profile","shop","certificate","forum","about","news"]):
-                    to_visit.append(full.rstrip("/"))
-        time.sleep(0.12)
+        links = get_links(html, url, allowed_base)
+        for l in links:
+            if l not in visited and l not in to_visit:
+                to_visit.append(l)
+        time.sleep(CRAWL_DELAY)
+    print("Crawl complete. Pages:", len(pages))
     return pages
 
-def get_python_urls_from_sitemap_or_crawl(max_pages=1000):
-    candidates = [
-        "https://www.w3schools.com/sitemap.xml",
-        "https://www.w3schools.com/sitemap_index.xml",
-        "https://www.w3schools.com/sitemap/sitemap.xml",
-        "https://www.w3schools.com/sitemap-index.xml",
-        "https://www.w3schools.com/robots.txt",
-    ]
-    found = []
-    for s in candidates:
-        try:
-            if s.endswith("robots.txt"):
-                r = requests.get(s, timeout=10)
-                if r.status_code == 200:
-                    for line in r.text.splitlines():
-                        if line.lower().startswith("sitemap:"):
-                            sitemap_url = line.split(":",1)[1].strip()
-                            urls = fetch_sitemap_urls(sitemap_url)
-                            for u in urls:
-                                if "/python/" in u.lower():
-                                    found.append(u)
-            else:
-                urls = fetch_sitemap_urls(s)
-                for u in urls:
-                    if "/python/" in u.lower():
-                        found.append(u)
-        except Exception:
-            pass
-        if found:
-            break
-    found = list(dict.fromkeys(found))
-    if found:
-        return found[:max_pages]
-    pages = simple_crawl_python(W3_PYTHON_ROOT, max_pages=max_pages)
-    return [p["url"] for p in pages]
+def chunk_page_text(url, text, min_chunk_chars=120):
+    """
+    Attempt to split by double-newline sections and headings, keep code blocks intact.
+    """
+    chunks = []
+    blocks = [b.strip() for b in text.split("\n\n") if b.strip()]
+    cur = ""
+    for b in blocks:
+        if len(cur) < min_chunk_chars:
+            cur = (cur + "\n\n" + b).strip()
+        else:
+            if len(cur) >= min_chunk_chars:
+                chunks.append({"url": url, "text": cur})
+            cur = b
+    if cur and len(cur) >= min_chunk_chars:
+        chunks.append({"url": url, "text": cur})
+    if not chunks and len(text) >= min_chunk_chars:
+        chunks.append({"url": url, "text": text})
+    return chunks
 
-def main(max_pages=500, batch_size=32, embed_model_name="all-MiniLM-L6-v2"):
-    print("Gathering python URLs (sitemap or crawl)...")
-    urls = get_python_urls_from_sitemap_or_crawl(max_pages=max_pages)
-    print(f"Found {len(urls)} python urls (lim {max_pages})")
-
-    session = requests.Session()
-    pages = []
-    for i, url in enumerate(urls, 1):
-        try:
-            r = session.get(url, timeout=20, headers={"User-Agent":"site-qa-bot/1.0"})
-            r.raise_for_status()
-            text = extract_text(r.text)
-            if len(text.strip()) >= 120:
-                pages.append({"url": url, "text": text})
-                print(f"[{i}] added {url}")
-        except Exception as e:
-            print(f"[{i}] skip {url} ({e})")
-        time.sleep(0.08)
-
-    # chunk
+def build_index(pages, embed_model_name=EMBED_MODEL, batch_size=EMBED_BATCH):
+    print(f"Embedding {sum(len(p['text'])>0 for p in pages)} pages -> chunking ...")
     chunks = []
     for p in pages:
-        for block in p["text"].split("\n\n"):
-            t = block.strip()
-            if len(t) >= 120:
-                chunks.append({"url": p["url"], "text": t})
+        c = chunk_page_text(p["url"], p["text"])
+        chunks.extend(c)
     print("Total chunks:", len(chunks))
-    if not chunks:
-        print("No chunks extracted. Exiting.")
-        return
+    if len(chunks) == 0:
+        raise RuntimeError("No chunks to embed")
 
-    # embed
     model = SentenceTransformer(embed_model_name)
     texts = [c["text"] for c in chunks]
-    embeddings = []
-    for i in range(0, len(texts), batch_size):
+    emb_batches = []
+    for i in tqdm(range(0, len(texts), batch_size), desc="Embedding"):
         batch = texts[i:i+batch_size]
         embs = model.encode(batch, convert_to_numpy=True, show_progress_bar=False)
-        embeddings.append(embs)
-        print(f"Embedded {i+len(batch)}/{len(texts)}")
-    X = np.vstack(embeddings).astype("float32")
-
-    # build faiss
+        emb_batches.append(embs)
+    X = np.vstack(emb_batches).astype("float32")
     dim = X.shape[1]
     print("Embedding dim:", dim)
     idx = faiss.IndexFlatL2(dim)
     idx.add(X)
-    print("Index built. saving to disk...")
+    # save
     faiss.write_index(idx, INDEX_FAISS)
     with open(INDEX_PKL, "wb") as f:
         pickle.dump(chunks, f)
-    print("Saved index and metadata to data/")
+    with open(CHUNKS_PKL, "wb") as f:
+        pickle.dump(chunks, f)
+    print("Index and metadata saved to data/")
+
+def main():
+    pages = simple_crawl(ROOT, max_pages=MAX_PAGES)
+    if not pages:
+        print("No pages found — exiting")
+        return
+    build_index(pages)
 
 if __name__ == "__main__":
-    main(max_pages=500, batch_size=32)
+    main()
