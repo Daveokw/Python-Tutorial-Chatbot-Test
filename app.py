@@ -12,16 +12,18 @@ from transformers import pipeline
 from dotenv import load_dotenv
 import trafilatura
 
-# ---------------- Config ----------------
 load_dotenv()
 GDRIVE_INDEX_FAISS_ID = os.getenv("GDRIVE_INDEX_FAISS_ID")
 GDRIVE_INDEX_PKL_ID = os.getenv("GDRIVE_INDEX_PKL_ID")
+GDRIVE_CHUNKS_PKL_ID = os.getenv("GDRIVE_CHUNKS_ID")
+
 HF_MODEL = os.getenv("HF_MODEL", "google/flan-t5-base")  # set to "-small" if limited
 
 DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
 INDEX_FAISS = os.path.join(DATA_DIR, "index.faiss")
 INDEX_PKL = os.path.join(DATA_DIR, "index.pkl")
+CHUNKS_PKL = os.path.join(DATA_DIR, "chunks.pkl")
 
 # ---------------- Silent download ----------------
 def download_from_gdrive_if_missing():
@@ -32,6 +34,9 @@ def download_from_gdrive_if_missing():
         if GDRIVE_INDEX_PKL_ID and not os.path.exists(INDEX_PKL):
             url = f"https://drive.google.com/uc?id={GDRIVE_INDEX_PKL_ID}"
             gdown.download(url, INDEX_PKL, quiet=True)
+        if GDRIVE_CHUNKS_PKL_ID and not os.path.exists(CHUNKS_PKL):
+            url = f"https://drive.google.com/uc?id={GDRIVE_CHUNKS_PKL_ID}"
+            gdown.download(url, CHUNKS_PKL, quiet=True)
     except Exception:
         pass
 
