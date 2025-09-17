@@ -179,45 +179,73 @@ def fallback_summarize_top_chunks(candidates_or_hits):
     except Exception:
         return None
 
-def synthesize_answer_rich(question, candidates, max_len=360):
+def synthesize_answer_rich(question, candidates, max_len=420):
+    """
+    Build a structured prompt that asks the generator to expand and produce
+    a friendly, informative answer. Allows a small set of safe background facts
+    for programming languages (creator, release year).
+    Returns (answer_text, top_sources)
+    """
     if not candidates:
         return None, []
+
+    # build short deduped facts (prefer variants that are longer / higher score)
     facts = []
     sources = []
-    for c in candidates[:4]:
-        a = c["answer"].strip()
-        if len(a) < 8:
+    for c in candidates[:6]:
+        a = c.get("answer","").strip()
+        if not a or len(a) < 8:
             continue
         facts.append(f"- {a}")
-        if c.get("source") and c.get("source") not in sources:
-            sources.append(c.get("source"))
-    if sum(len(f) for f in facts) < 40:
-        summ = fallback_summarize_top_chunks(candidates)
+        src = c.get("source")
+        if src and src not in sources:
+            sources.append(src)
+    # fallback: if facts are extremely short, use summarizer on top texts
+    if sum(len(f) for f in facts) < 60:
+        summ = None
+        try:
+            if summarizer:
+                # summarizer expects a single long text
+                joined = "\n\n".join([c.get("text","") for c in candidates[:3]])
+                if joined and len(joined) > 200:
+                    out = summarizer(joined, max_length=140, min_length=60, do_sample=False)
+                    summ = out[0].get("summary_text","").strip()
+        except Exception:
+            summ = None
         if summ:
             facts = [f"- {summ}"]
+
     if not facts:
         return None, sources[:2]
+
     facts_block = "\n".join(facts)
+
+    # Add a short knowledge whitelist for safe background facts for 'python'
+    background_guidance = (
+        "You may add only very small, widely-known background facts such as the creator and first release year "
+        "for programming languages (for example: 'Python was created by Guido van Rossum and first released in 1991'). "
+        "Do NOT invent other facts or details not implied by the facts below."
+    )
+
     prompt = (
-        "You are a helpful assistant. Using ONLY the facts below, produce a friendly, concise answer. "
-        "You MAY include very small, widely-known background facts for programming languages (creator & release year) but do NOT invent other facts. "
-        "Structure the answer as:\n"
-        "1) One-line definition.\n"
-        "2) 'What makes it special?' — 3 bullets.\n"
-        "3) 'What can you build?' — 3 bullets.\n"
-        "4) A tiny example in ```python``` if relevant.\n"
-        "5) A one-sentence encouraging closing line.\n"
-        "If facts are insufficient, reply exactly: \"I couldn't find this in the site data.\".\n\n"
+        "You are a helpful, friendly AI tutor. Use ONLY the facts below as your main source. "
+        + background_guidance
+        + " Produce a clear answer with this structure:\n\n"
+        "1) One-line definition/summary.\n"
+        "2) 'What makes it special?' (3 bullets)\n"
+        "3) 'What can you build?' (3 bullets)\n"
+        "4) A tiny example in ```python``` if relevant (1-4 lines).\n"
+        "5) One encouraging closing sentence.\n\n"
         f"Question: {question}\n\nFacts:\n{facts_block}\n\nAnswer:"
     )
+
     try:
         out = gen_pipeline(prompt, max_length=max_len, do_sample=False)
         text = out[0].get("generated_text","").strip()
         text = re.sub(r"\s{2,}", " ", text).strip()
-        top_sources = sources[:2]
-        return text, top_sources
+        return text, sources[:2]
     except Exception:
-        return None, []
+        return None, sources[:2]
 
 # ---------------- URL-on-demand QA ----------------
 def fetch_main_from_url(url):
