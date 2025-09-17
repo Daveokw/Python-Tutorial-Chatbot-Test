@@ -1,6 +1,6 @@
+# app.py
 import os
 import pickle
-import time
 import gdown
 import faiss
 import numpy as np
@@ -15,36 +15,30 @@ from dotenv import load_dotenv
 load_dotenv()
 GDRIVE_INDEX_FAISS_ID = os.getenv("GDRIVE_INDEX_FAISS_ID")
 GDRIVE_INDEX_PKL_ID = os.getenv("GDRIVE_INDEX_PKL_ID")
-GDRIVE_CHUNKS_ID     = os.getenv("GDRIVE_CHUNKS_ID")  
 
 DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
 INDEX_FAISS = os.path.join(DATA_DIR, "index.faiss")
 INDEX_PKL = os.path.join(DATA_DIR, "index.pkl")
-CHUNKS_PICKLE = os.path.join(DATA_DIR, "chunks.pkl")
 
 # ------------------------
-# Helpers: download index from Google Drive (if missing)
+# Helpers: download index from Google Drive (silent)
 # ------------------------
 def download_from_gdrive_if_missing():
-    """Download index.faiss and index.pkl from Google Drive using file IDs in env vars."""
-    downloaded = False
-    if GDRIVE_INDEX_FAISS_ID and not os.path.exists(INDEX_FAISS):
-        url = f"https://drive.google.com/uc?id={GDRIVE_INDEX_FAISS_ID}"
-        st.info("Downloading vector index (this may take a moment)...")
-        gdown.download(url, INDEX_FAISS, quiet=False)
-        downloaded = True
-    if GDRIVE_INDEX_PKL_ID and not os.path.exists(INDEX_PKL):
-        url = f"https://drive.google.com/uc?id={GDRIVE_INDEX_PKL_ID}"
-        st.info("Downloading index metadata (this may take a moment)...")
-        gdown.download(url, INDEX_PKL, quiet=False)
-        downloaded = True
-    if GDRIVE_CHUNKS_ID and not os.path.exists(CHUNKS_PICKLE):
-        url = f"https://drive.google.com/uc?id={GDRIVE_CHUNKS_ID}"
-        st.info("Downloading index metadata (this may take a moment)...")
-        gdown.download(url, CHUNKS_PICKLE, quiet=False)
-        downloaded = True
-    return downloaded
+    """
+    Download index files from Google Drive using gdown if they are missing locally.
+    This runs silently (no UI messages).
+    """
+    try:
+        if GDRIVE_INDEX_FAISS_ID and not os.path.exists(INDEX_FAISS):
+            url = f"https://drive.google.com/uc?id={GDRIVE_INDEX_FAISS_ID}"
+            gdown.download(url, INDEX_FAISS, quiet=True)
+        if GDRIVE_INDEX_PKL_ID and not os.path.exists(INDEX_PKL):
+            url = f"https://drive.google.com/uc?id={GDRIVE_INDEX_PKL_ID}"
+            gdown.download(url, INDEX_PKL, quiet=True)
+    except Exception:
+        # ignore download errors here; load_index_and_chunks will handle missing files
+        pass
 
 # ------------------------
 # Cached resource loaders
@@ -54,9 +48,13 @@ def load_embed_model(name="all-MiniLM-L6-v2"):
     return SentenceTransformer(name)
 
 @st.cache_resource(show_spinner=False)
-def load_qa_pipeline():
-    # Small extractive QA model that runs on CPU; swap for a different HF model if you prefer.
-    return pipeline("question-answering", model="distilbert-base-cased-distilled-squad")
+def load_gen_pipeline():
+    """
+    Use a small FLAN-T5 model for text-to-text generation.
+    It produces natural answers given a prompt + context.
+    """
+    # Use the small variant for reasonable CPU usage. Swap for a larger model if you have more resources.
+    return pipeline("text2text-generation", model="google/flan-t5-small", device_map=None)
 
 @st.cache_resource(show_spinner=False)
 def load_index_and_chunks():
@@ -78,7 +76,7 @@ def load_index_and_chunks():
 # Search & answer helpers
 # ------------------------
 embed_model = load_embed_model()
-qa_pipeline = load_qa_pipeline()
+gen_pipeline = load_gen_pipeline()
 
 def search_index(idx, chunks, question, k=4):
     qv = embed_model.encode([question], convert_to_numpy=True).astype("float32")
@@ -89,78 +87,75 @@ def search_index(idx, chunks, question, k=4):
             results.append(chunks[idx_i])
     return results
 
-def build_context_from_hits(hits, max_chars=3000):
+def build_context_from_hits(hits, max_chars=2500):
+    """
+    Merge retrieved chunks into a single context string, trimming to max_chars.
+    """
     pieces = []
-    sources = []
     for h in hits:
         txt = h.get("text","").strip()
-        url = h.get("url","")
         if txt:
-            piece = f"{txt}"
-            pieces.append(piece)
-            if url:
-                sources.append(url)
+            pieces.append(txt)
     context = "\n\n".join(pieces)
-    # truncate to a reasonable size for the QA model
     if len(context) > max_chars:
         context = context[:max_chars]
-    return context, list(dict.fromkeys(sources))
+    return context
 
-def answer_with_hf(question, context):
+def answer_with_generation(question, context, max_length=200):
+    """
+    Use FLAN-T5-style text2text generation to produce a natural answer grounded in context.
+    If context is empty, returns None.
+    """
     if not context.strip():
         return None
+    # Build a clear prompt instructing the model to answer using only the context
+    prompt = (
+        "Answer the user's question using ONLY the information from the context below. "
+        "If the answer is not present in the context, reply: \"I couldn't find this in the site data.\".\n\n"
+        f"Context:\n{context}\n\n"
+        f"Question: {question}\n\nAnswer:"
+    )
     try:
-        res = qa_pipeline(question=question, context=context, topk=1)
-        # pipeline returns dict (single) or list if topk>1
-        if isinstance(res, list):
-            res = res[0]
-        return res.get("answer", "").strip()
+        out = gen_pipeline(prompt, max_length=max_length, do_sample=False)
+        # out is a list of dicts [{'generated_text': '...'}]
+        text = out[0].get("generated_text","").strip()
+        return text
     except Exception:
         return None
 
 # ------------------------
-# App UI (minimal)
+# Streamlit UI (minimal)
 # ------------------------
 st.set_page_config(page_title="W3Schools Python Chatbot", layout="centered")
 st.title("🐍 W3Schools Python — Q&A")
 
-# Ensure index present (download if needed), then load
-with st.spinner("Preparing index..."):
-    # Try download from Google Drive if missing
-    download_from_gdrive_if_missing()
-    INDEX, CHUNKS = load_index_and_chunks()
+# silent attempt to ensure index files exist (no UI messages)
+download_from_gdrive_if_missing()
+
+# load index
+INDEX, CHUNKS = load_index_and_chunks()
 
 if INDEX is None or CHUNKS is None:
-    st.warning("Index not available. If you uploaded index files to Google Drive, set the GDRIVE_INDEX_FAISS_ID and GDRIVE_INDEX_PKL_ID environment variables. Otherwise run the index builder locally and upload the files.")
-    # Still show a simple input but disable Ask until index is available
-    query = st.text_input("Ask a question about W3Schools Python (index not loaded yet):", value="")
+    st.warning("Index not available. Please upload index files to Google Drive and set GDRIVE_INDEX_FAISS_ID and GDRIVE_INDEX_PKL_ID as secrets, or run the index builder locally.")
+    # still display a very minimal input but don't attempt to answer without the index
+    st.text_input("Ask a question about W3Schools Python (index not loaded):")
     st.stop()
 
-# Input area (single box)
+# main input / ask button
 query = st.text_input("Ask a question about W3Schools Python:", value="", key="query_input")
 ask = st.button("Ask")
 
 if ask and query.strip():
-    with st.spinner("Retrieving and answering..."):
-        try:
-            hits = search_index(INDEX, CHUNKS, query, k=5)
-            context, sources = build_context_from_hits(hits, max_chars=3000)
-            answer = answer_with_hf(query, context)
-            if answer:
+    with st.spinner("Thinking..."):
+        hits = search_index(INDEX, CHUNKS, query, k=6)
+        context = build_context_from_hits(hits, max_chars=2500)
+        answer = answer_with_generation(query, context, max_length=220)
+        if answer:
+            # simple clean-up: if model returns the fallback phrase, show it exactly
+            if "couldn't find" in answer.lower() or "could not find" in answer.lower():
+                st.info("I couldn't find this in the site data.")
+            else:
                 st.markdown("### 🧠 Answer")
                 st.write(answer)
-            else:
-                st.info("I couldn't find a confident answer in the indexed content.")
-                # show retrieved excerpts as fallback
-                st.markdown("### Retrieved excerpts")
-                for h in hits:
-                    url = h.get("url","")
-                    st.write(f"- [{url}]({url})" if url else "- (no url)")
-                    st.write(h.get("text","")[:800] + ("..." if len(h.get("text",""))>800 else ""))
-            # show sources (compact)
-            if sources:
-                st.markdown("### 📌 Sources")
-                for s in sources:
-                    st.write(f"- [{s}]({s})")
-        except Exception:
-            st.error("An error occurred while searching or answering. Please try again.")
+        else:
+            st.info("I couldn't find a confident answer in the indexed content.")
