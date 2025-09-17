@@ -1,7 +1,5 @@
 fastapi
-uvicorn[standard]
 python-dotenv
-openai>=1.0.0
 sentence-transformers
 faiss-cpu
 requests
@@ -10,3 +8,6 @@ tqdm
 numpy
 streamlit
 gdown
+trafilatura
+transformers
+torch
