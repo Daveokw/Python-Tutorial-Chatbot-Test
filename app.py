@@ -1,10 +1,3 @@
-#!/usr/bin/env python3
-"""
-Minimal Streamlit app for the docs.python.org tutorial index.
-UI: Title, single textbox, Ask button, answer area.
-Retrieval: sentence-transformers + FAISS.
-Generator: HF flan-t5-small by default (optional).
-"""
 import os, re, pickle
 import streamlit as st
 import gdown
@@ -15,16 +8,15 @@ import faiss
 import numpy as np
 from dotenv import load_dotenv
 
-# trafilatura optional — not required for serving
 try:
     import trafilatura
 except Exception:
     trafilatura = None
 
 load_dotenv()
-GDRIVE_INDEX_FAISS_ID = os.getenv("GDRIVE_INDEX_FAISS_ID")  # optional
-GDRIVE_INDEX_PKL_ID  = os.getenv("GDRIVE_INDEX_PKL_ID")     # optional
-HF_MODEL = os.getenv("HF_MODEL", "google/flan-t5-small")    # default small for cloud
+GDRIVE_INDEX_FAISS_ID = os.getenv("GDRIVE_INDEX_FAISS_ID")  
+GDRIVE_INDEX_PKL_ID  = os.getenv("GDRIVE_INDEX_PKL_ID")     
+HF_MODEL = os.getenv("HF_MODEL", "google/flan-t5-small")   
 
 DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -32,7 +24,6 @@ INDEX_FAISS = os.path.join(DATA_DIR, "index.faiss")
 INDEX_PKL = os.path.join(DATA_DIR, "index.pkl")
 CHUNKS_PKL = os.path.join(DATA_DIR, "chunks.pkl")
 
-# silent download helper (quiet)
 def download_from_gdrive_if_missing():
     try:
         if GDRIVE_INDEX_FAISS_ID and not os.path.exists(INDEX_FAISS):
@@ -74,7 +65,6 @@ def load_index():
     except Exception:
         return None, None
 
-# simple cleaner to remove nav noise
 BOILERPLATE = ["W3Schools","©","Privacy","Terms","Search","Get Certified","Sign In","Menu"]
 def clean_text(s):
     if not s:
@@ -85,7 +75,6 @@ def clean_text(s):
     out = re.sub(r"\s{2,}", " ", out)
     return out.strip()
 
-# retrieval helpers
 embed_model = load_embed_model()
 extractive = load_extractive()
 gen = load_gen()
@@ -102,7 +91,6 @@ def search_index(idx, chunks, question, k=6):
 def pick_best_candidate(candidates):
     if not candidates:
         return None
-    # dedupe by normalized answer; keep highest score
     best = {}
     for c in candidates:
         key = re.sub(r'\s+',' ', c['answer'].strip().lower())
@@ -173,11 +161,9 @@ def synthesize_expanded(question, candidates):
     except Exception:
         return None, srcs[:2]
 
-# ---------- Streamlit UI ----------
 st.set_page_config(page_title="Python Tutorial Chatbot", layout="centered")
 st.title("🐍 Python Tutorial Chatbot")
 
-# silent download if env set
 download_from_gdrive_if_missing()
 INDEX, CHUNKS = load_index()
 
@@ -196,7 +182,6 @@ if st.button("Ask") and q.strip():
             st.write(concise)
             if src:
                 st.markdown(f"**Source:** [{src}]({src})")
-            # show expanded on demand
             if st.button("Show expanded answer"):
                 expanded, sources = synthesize_expanded(q, candidates)
                 if expanded:
@@ -207,7 +192,6 @@ if st.button("Ask") and q.strip():
                 else:
                     st.info("No expanded answer available.")
         else:
-            # fallback: synthesize from top chunks (if any)
             if candidates:
                 expanded, sources = synthesize_expanded(q, candidates)
                 if expanded:
