@@ -1,174 +1,216 @@
 import os
+import sys
 import time
+import argparse
 import pickle
-import requests
 from urllib.parse import urljoin, urlparse
+import requests
 from bs4 import BeautifulSoup
-import trafilatura
-from sentence_transformers import SentenceTransformer
-import numpy as np
-import faiss
 from tqdm import tqdm
 
-ROOT = "https://www.w3schools.com/python/"
+try:
+    import trafilatura
+except Exception:
+    trafilatura = None
+
+try:
+    from sentence_transformers import SentenceTransformer
+except Exception:
+    print("ERROR: sentence-transformers is required. Install with: pip install sentence-transformers")
+    sys.exit(1)
+
+try:
+    import faiss
+except Exception:
+    print("ERROR: faiss (faiss-cpu) is required. Install with: pip install faiss-cpu")
+    sys.exit(1)
+
+import numpy as np
+
+ROOT = "https://docs.python.org/3/tutorial/"
 DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
 INDEX_FAISS = os.path.join(DATA_DIR, "index.faiss")
 INDEX_PKL = os.path.join(DATA_DIR, "index.pkl")
 CHUNKS_PKL = os.path.join(DATA_DIR, "chunks.pkl")
 
-EMBED_MODEL = "all-MiniLM-L6-v2"
-EMBED_BATCH = 32
-MAX_PAGES = 800
-CRAWL_DELAY = 0.12
 USER_AGENT = "site-qa-bot/1.0"
+DEFAULT_MODEL = "all-MiniLM-L6-v2"
+DEFAULT_MIN_CHUNK_CHARS = 800
+DEFAULT_OVERLAP_CHARS = 150
 
-def fetch_url(url, session=None, timeout=15):
-    s = session or requests.Session()
+session = requests.Session()
+session.headers.update({"User-Agent": USER_AGENT})
+
+def fetch_url_text(url, timeout=15):
     try:
-        r = s.get(url, timeout=timeout, headers={"User-Agent": USER_AGENT})
+        r = session.get(url, timeout=timeout)
         r.raise_for_status()
         return r.text
     except Exception:
         return None
 
-def extract_main_with_trafilatura(html, url):
-    try:
-        main = trafilatura.extract(html, output_format="text")
-    except Exception:
-        main = None
-    soup = BeautifulSoup(html, "html.parser")
-    code_blocks = []
-    for pre in soup.find_all("pre"):
-        txt = pre.get_text().strip()
-        if txt:
-            code_blocks.append("```\n" + txt + "\n```")
-    headings = []
-    for h in soup.find_all(["h1","h2","h3"]):
-        headings.append(h.get_text().strip())
-    combined = ""
-    if main and len(main.strip()) > 50:
-        combined = main.strip()
-    else:
-        combined = soup.get_text(separator="\n").strip()
-    if code_blocks:
-        combined += "\n\n" + "\n\n".join(code_blocks)
-    return combined
+def extract_main(html):
+    """
+    Prefer trafilatura for main extraction; fall back to BeautifulSoup.
+    Preserve code blocks (pre).
+    """
+    if not html:
+        return ""
+    text = None
+    if trafilatura:
+        try:
+            main = trafilatura.extract(html)
+            if main and len(main.strip()) > 50:
+                text = main.strip()
+        except Exception:
+            text = None
 
-def clean_url(u):
-    return u.rstrip("/")
+    if text is None:
+        soup = BeautifulSoup(html, "html.parser")
+        for s in soup(["script", "style", "noscript", "iframe"]):
+            s.decompose()
+        for sel in ("header", "footer", "nav", "aside"):
+            for el in soup.select(sel):
+                el.decompose()
+        parts = []
+        for tag in soup.find_all(["h1","h2","h3","p","li","pre","code"]):
+            t = tag.get_text(separator="\n").strip()
+            if t:
+                parts.append(t)
+        text = "\n\n".join(parts).strip()
+
+    try:
+        soup2 = BeautifulSoup(html, "html.parser")
+        codes = []
+        for pre in soup2.find_all("pre"):
+            c = pre.get_text().strip()
+            if c and len(c) > 10:
+                codes.append("```\n" + c + "\n```")
+        if codes:
+            if text:
+                text = text + "\n\n" + "\n\n".join(codes)
+            else:
+                text = "\n\n".join(codes)
+    except Exception:
+        pass
+
+    return text or ""
 
 def get_links(html, base_url, allowed_prefix):
-    soup = BeautifulSoup(html, "html.parser")
+    """
+    Extract same-site links that start with allowed_prefix.
+    """
     links = set()
+    if not html:
+        return links
+    soup = BeautifulSoup(html, "html.parser")
     for a in soup.find_all("a", href=True):
-        href = a["href"].split("#")[0]
-        if not href or href.startswith("javascript:"):
+        href = a["href"].split("#")[0].strip()
+        if not href:
+            continue
+        if href.startswith("javascript:") or href.startswith("mailto:"):
             continue
         full = urljoin(base_url, href)
-        if full.startswith(allowed_prefix) and (not any(x in full.lower() for x in ["tryit.asp","signup","login","profile","shop","certificate","forum","about","news"])):
-            links.add(clean_url(full))
+        if full.startswith(allowed_prefix):
+            if any(x in full.lower() for x in ["print.html", "genindex.html", "py-modindex.html"]):
+                continue
+            links.add(full.rstrip("/"))
     return links
 
-def simple_crawl(start_url, max_pages=500):
-    print("Starting crawl:", start_url)
-    session = requests.Session()
+def simple_crawl(start_url, max_pages=300, politeness=0.12):
+    allowed_prefix = "{uri.scheme}://{uri.netloc}/3/tutorial".format(uri=urlparse(start_url))
     visited = set()
-    to_visit = [clean_url(start_url)]
+    to_visit = [start_url.rstrip("/")]
     pages = []
-    allowed_base = "{uri.scheme}://{uri.netloc}".format(uri=urlparse(start_url)) + "/python"
     while to_visit and len(visited) < max_pages:
         url = to_visit.pop(0)
         if url in visited:
             continue
-        html = fetch_url(url, session=session)
+        html = fetch_url_text(url)
         if not html:
             visited.add(url)
             continue
-        text = extract_main_with_trafilatura(html, url)
-        if text and len(text.strip()) > 120:
+        text = extract_main(html)
+        if text and len(text.strip()) >= 120:
             pages.append({"url": url, "text": text})
             print("Collected:", url)
         visited.add(url)
-        links = get_links(html, url, allowed_base)
+        links = get_links(html, url, allowed_prefix)
         for l in links:
-            if l not in visited and l not in to_visit:
+            if l not in visited and l not in to_visit and len(visited) + len(to_visit) < max_pages:
                 to_visit.append(l)
-        time.sleep(CRAWL_DELAY)
-    print("Crawl complete. Pages:", len(pages))
+        time.sleep(politeness)
     return pages
 
-def chunk_page_text(url, text, min_chunk_chars=700, overlap_chars=150):
+def chunk_page_text(url, text, min_chunk_chars=DEFAULT_MIN_CHUNK_CHARS, overlap_chars=DEFAULT_OVERLAP_CHARS):
     """
-    Create larger chunks (~min_chunk_chars) with overlap so each chunk has
-    enough context (paragraphs + code examples).
+    Create larger overlapping chunks from page text.
     """
-    text = text.strip()
     if not text:
         return []
-    # split by paragraphs (double newline)
     blocks = [b.strip() for b in text.split("\n\n") if b.strip()]
     chunks = []
     cur = ""
     for b in blocks:
-        if cur:
-            cand = cur + "\n\n" + b
-        else:
-            cand = b
+        cand = (cur + "\n\n" + b).strip() if cur else b
         if len(cand) >= min_chunk_chars:
-            # push chunk (keep some overlap)
             chunks.append({"url": url, "text": cand})
-            # start new cur as last overlap_chars of cand
-            if overlap_chars > 0:
-                cur = cand[-overlap_chars:]
-            else:
-                cur = ""
+            cur = cand[-overlap_chars:] if overlap_chars > 0 else ""
         else:
             cur = cand
-    # final
     if cur and len(cur) >= 120:
         chunks.append({"url": url, "text": cur})
-    # safeguard: if still no chunks, add the whole page
     if not chunks and len(text) >= 120:
         chunks = [{"url": url, "text": text}]
     return chunks
 
-def build_index(pages, embed_model_name=EMBED_MODEL, batch_size=EMBED_BATCH):
-    print(f"Embedding {sum(len(p['text'])>0 for p in pages)} pages -> chunking ...")
-    chunks = []
+def build_index_from_pages(pages, embed_model_name=DEFAULT_MODEL, batch_size=32, min_chunk_chars=DEFAULT_MIN_CHUNK_CHARS, overlap_chars=DEFAULT_OVERLAP_CHARS):
+    all_chunks = []
     for p in pages:
-        c = chunk_page_text(p["url"], p["text"])
-        chunks.extend(c)
-    print("Total chunks:", len(chunks))
-    if len(chunks) == 0:
-        raise RuntimeError("No chunks to embed")
-
+        cs = chunk_page_text(p["url"], p["text"], min_chunk_chars, overlap_chars)
+        all_chunks.extend(cs)
+    print("Total chunks:", len(all_chunks))
+    if not all_chunks:
+        raise RuntimeError("No chunks produced.")
     model = SentenceTransformer(embed_model_name)
-    texts = [c["text"] for c in chunks]
-    emb_batches = []
+    texts = [c["text"] for c in all_chunks]
+    emb_arrays = []
     for i in tqdm(range(0, len(texts), batch_size), desc="Embedding"):
         batch = texts[i:i+batch_size]
         embs = model.encode(batch, convert_to_numpy=True, show_progress_bar=False)
-        emb_batches.append(embs)
-    X = np.vstack(emb_batches).astype("float32")
+        emb_arrays.append(embs)
+    X = np.vstack(emb_arrays).astype("float32")
     dim = X.shape[1]
     print("Embedding dim:", dim)
     idx = faiss.IndexFlatL2(dim)
     idx.add(X)
-    # save
     faiss.write_index(idx, INDEX_FAISS)
     with open(INDEX_PKL, "wb") as f:
-        pickle.dump(chunks, f)
+        pickle.dump(all_chunks, f)
     with open(CHUNKS_PKL, "wb") as f:
-        pickle.dump(chunks, f)
-    print("Index and metadata saved to data/")
+        pickle.dump(all_chunks, f)
+    print("Saved index:", INDEX_FAISS)
+    print("Saved metadata:", INDEX_PKL, CHUNKS_PKL)
+    return idx, all_chunks
 
 def main():
-    pages = simple_crawl(ROOT, max_pages=MAX_PAGES)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--max-pages", type=int, default=300, help="Max pages to fetch/crawl")
+    parser.add_argument("--batch-size", type=int, default=32, help="Embedding batch size")
+    parser.add_argument("--model", type=str, default=DEFAULT_MODEL, help="SentenceTransformer model name")
+    parser.add_argument("--min-chunk-chars", type=int, default=DEFAULT_MIN_CHUNK_CHARS, help="Minimum characters per chunk")
+    parser.add_argument("--overlap-chars", type=int, default=DEFAULT_OVERLAP_CHARS, help="Overlap characters between chunks")
+    args = parser.parse_args()
+
+    print("Starting crawl of:", ROOT)
+    pages = simple_crawl(ROOT, max_pages=args.max_pages)
     if not pages:
-        print("No pages found — exiting")
+        print("No pages were discovered. Exiting.")
         return
-    build_index(pages)
+    print(f"Building index from {len(pages)} pages (model={args.model}, batch={args.batch_size})")
+    build_index_from_pages(pages, embed_model_name=args.model, batch_size=args.batch_size, min_chunk_chars=args.min_chunk_chars, overlap_chars=args.overlap_chars)
+    print("Done.")
 
 if __name__ == "__main__":
     main()
