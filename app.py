@@ -1,13 +1,3 @@
-#!/usr/bin/env python3
-"""
-app.py - Streamlit front-end (improved definition extraction + curated fallbacks)
-
-UI: single textbox, Ask button, concise answer display (polished).
-Behavior:
- - Loads data/index.faiss and data/index.pkl from ./data/ or downloads them from Google Drive if GDRIVE_* env vars set.
- - Retrieval: sentence-transformers + FAISS
- - Answering: prefer definition-like sentences; fallback to extractive QA, summarizer, generator, or curated safe facts.
-"""
 import os
 import re
 import pickle
@@ -21,27 +11,28 @@ from transformers import pipeline
 
 load_dotenv()
 
-# Optional Drive IDs (set these in Streamlit Cloud or .env if you want auto-download)
 GDRIVE_INDEX_FAISS_ID = os.getenv("GDRIVE_INDEX_FAISS_ID")
 GDRIVE_INDEX_PKL_ID = os.getenv("GDRIVE_INDEX_PKL_ID")
-HF_MODEL = os.getenv("HF_MODEL", "google/flan-t5-small")  # small by default
+GDRIVE_CHUNKS_ID = os.getenv("GDRIVE_CHUNKS_ID")
+HF_MODEL = os.getenv("HF_MODEL", "google/flan-t5-base")
 
 DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
 INDEX_FAISS = os.path.join(DATA_DIR, "index.faiss")
 INDEX_PKL = os.path.join(DATA_DIR, "index.pkl")
+CHUNKS_ID = os.path.join(DATA_DIR, "chunks.pkl")
 
-# ---------- helper: quiet download from Google Drive ----------
 def download_from_gdrive_if_missing():
     try:
         if GDRIVE_INDEX_FAISS_ID and not os.path.exists(INDEX_FAISS):
             gdown.download(f"https://drive.google.com/uc?id={GDRIVE_INDEX_FAISS_ID}", INDEX_FAISS, quiet=True)
         if GDRIVE_INDEX_PKL_ID and not os.path.exists(INDEX_PKL):
             gdown.download(f"https://drive.google.com/uc?id={GDRIVE_INDEX_PKL_ID}", INDEX_PKL, quiet=True)
+        if GDRIVE_CHUNKS_ID and not os.path.exists(CHUNKS_PKL):
+            gdown.download(f"https://drive.google.com/uc?id={GDRIVE_CHUNKS_ID}", CHUNKS_PKL, quiet=True)
     except Exception:
         pass
 
-# ---------- cached model loaders ----------
 @st.cache_resource(show_spinner=False)
 def load_embed_model(name="all-MiniLM-L6-v2"):
     return SentenceTransformer(name)
@@ -81,7 +72,6 @@ def load_index_and_chunks():
     except Exception:
         return None, None
 
-# ---------- cleaning helpers ----------
 def fix_encoding(s: str) -> str:
     if not s:
         return ""
@@ -104,7 +94,6 @@ def clean_text(s: str) -> str:
     out = re.sub(r"\s{2,}", " ", out)
     return out.strip()
 
-# ---------- retrieval & QA ----------
 embed_model = load_embed_model()
 extractive_qa = load_extractive_qa()
 summarizer = load_summarizer()
@@ -142,7 +131,6 @@ def extractive_candidates(hits, question, keep_top=8):
     cand = sorted(cand, key=lambda x: (-x["score"], x["dist"]))[:keep_top]
     return cand
 
-# ---------- canonicalization + curated fallbacks ----------
 CANONICAL_MAP = {
     "oop": "object oriented programming",
     "object oriented programming": "object oriented programming",
@@ -150,8 +138,6 @@ CANONICAL_MAP = {
     "python": "python",
 }
 
-# safe curated background facts (used only as a fallback when site does not contain a clear definition).
-# You can edit/add entries — make them short factual statements.
 CURATED_FACTS = {
     "python": (
         "Python is a high-level, general-purpose programming language known for its simplicity and readability. "
@@ -171,7 +157,6 @@ def canonicalize(q: str) -> str:
     q0 = re.sub(r'\s+', ' ', q0).strip()
     return CANONICAL_MAP.get(q0, q0)
 
-# ---------- strong definition-finding (scoring sentences) ----------
 SENT_SPLIT_RE = re.compile(r'(?<=[\.\?\!])\s+')
 DEFINITION_VERBS = r"(?:\b(is|was|are|refers to|means|provides|represents|describes|allows|implements|supports)\b)"
 BOOST_TERMS = [
@@ -183,23 +168,17 @@ def score_sentence(sentence: str, canonical_keyword: str, base_score: float=0.0,
     """Compute score for a candidate sentence. Higher = better."""
     s = sentence.lower()
     score = base_score
-    # presence of canonical keyword
     if canonical_keyword and canonical_keyword in s:
         score += 2.5
-    # strong definition pattern
     if re.search(rf"\b{re.escape(canonical_keyword)}\b.*{DEFINITION_VERBS}", s) or re.search(rf"{DEFINITION_VERBS}.*\b{re.escape(canonical_keyword)}\b", s):
         score += 4.0
-    # boost if contains boost terms
     for t in BOOST_TERMS:
         if t in s:
             score += 1.5
-    # penalize very short sentences or lines that look like menus
     if len(sentence.strip()) < 30:
         score -= 2.0
-    # penalize uppercase-only lines (likely headings)
     if sentence.strip().isupper():
         score -= 2.0
-    # factor in distance (smaller dist = more relevant)
     try:
         score += (1.0 / (1.0 + dist)) * 2.0
     except Exception:
@@ -212,7 +191,7 @@ def find_best_definition(hits, user_query, top_k_hits=10):
     """
     canonical = canonicalize(user_query)
     candidates = []
-    hits_sorted = sorted(hits, key=lambda x: x[1])[:top_k_hits]  # prefer lower distance
+    hits_sorted = sorted(hits, key=lambda x: x[1])[:top_k_hits]
     for h, dist in hits_sorted:
         text = clean_text(h.get("text",""))
         if not text:
@@ -221,34 +200,26 @@ def find_best_definition(hits, user_query, top_k_hits=10):
         for s in sents:
             if not s or len(s.strip()) < 20:
                 continue
-            # skip lines that look like nav/menu (few words and uppercase)
             if len(s.strip().split()) <= 4 and s.strip().isupper():
                 continue
             base = 0.0
-            # if this sentence appears in extractive candidate we can later incorporate base score (not available here)
             sc = score_sentence(s, canonical_keyword=canonical, base_score=base, dist=dist)
-            if sc > -1.5:  # weak filter
+            if sc > -1.5: 
                 candidates.append({"sent": s.strip(), "score": sc, "source": h.get("url","")})
     if not candidates:
         return None, None
-    # sort and return top
     best = sorted(candidates, key=lambda x: -x["score"])[0]
     s = best["sent"]
-    # ensure punctuation at end
     if not re.search(r'[.!?]$', s):
         s = s + '.'
-    # cleanup whitespace
     s = re.sub(r'\s{2,}', ' ', s).strip()
     return s, best.get("source")
 
-# ---------- concise + expanded answer logic ----------
 def get_concise_answer(question, hits, candidates):
-    # 1) try best definition from indexed chunks
     sent, src = find_best_definition(hits, question, top_k_hits=10)
     if sent:
         return sent, src
 
-    # 2) pick best extractive candidate (if any)
     if candidates:
         top = candidates[0]
         one = top.get("answer","").strip()
@@ -257,7 +228,6 @@ def get_concise_answer(question, hits, candidates):
             one += '.'
         return one, top.get("source","")
 
-    # 3) summarizer fallback over top hits
     if summarizer and hits:
         texts = []
         for h, d in hits[:3]:
@@ -275,12 +245,10 @@ def get_concise_answer(question, hits, candidates):
             except Exception:
                 pass
 
-    # 4) curated fallback if canonical present
     canonical = canonicalize(question)
     if canonical in CURATED_FACTS:
         return CURATED_FACTS[canonical], "general knowledge"
 
-    # 5) generator fallback: ask generator to produce a 1-line definition from top candidates (last resort)
     if generator and candidates:
         facts = []
         used = set()
@@ -341,11 +309,9 @@ def synthesize_expanded(question, candidates):
     except Exception:
         return None, sources[:2]
 
-# ---------- Streamlit UI (minimal) ----------
 st.set_page_config(page_title="Python Tutorial Chatbot", layout="centered")
 st.title("🐍 Python Tutorial Chatbot")
 
-# try to download index from Drive if IDs provided (quiet)
 download_from_gdrive_if_missing()
 INDEX, CHUNKS = load_index_and_chunks()
 
@@ -364,7 +330,6 @@ if st.button("Ask") and query.strip():
             st.write(concise)
             if source:
                 st.markdown(f"**Source:** {source}" if source == "general knowledge" else f"**Source:** [{source}]({source})")
-            # expand button
             if st.button("Show expanded answer"):
                 expanded, sources = synthesize_expanded(query, candidates)
                 if expanded:
