@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-app.py
+app.py - Streamlit front-end (improved definition extraction + curated fallbacks)
 
-Minimal Streamlit UI. Improved definition detection:
- - maps short queries (e.g., 'oop') to expanded phrase ('object oriented programming')
- - prefers sentences that explicitly define the term (e.g., 'Object-oriented programming is...')
- - removes encoding garbage (Â etc.)
- - falls back to extractive QA, summarizer, then generator
+UI: single textbox, Ask button, concise answer display (polished).
+Behavior:
+ - Loads data/index.faiss and data/index.pkl from ./data/ or downloads them from Google Drive if GDRIVE_* env vars set.
+ - Retrieval: sentence-transformers + FAISS
+ - Answering: prefer definition-like sentences; fallback to extractive QA, summarizer, generator, or curated safe facts.
 """
 import os
 import re
@@ -21,17 +21,17 @@ from transformers import pipeline
 
 load_dotenv()
 
-# Optional Drive IDs (set in Streamlit Cloud or .env)
+# Optional Drive IDs (set these in Streamlit Cloud or .env if you want auto-download)
 GDRIVE_INDEX_FAISS_ID = os.getenv("GDRIVE_INDEX_FAISS_ID")
 GDRIVE_INDEX_PKL_ID = os.getenv("GDRIVE_INDEX_PKL_ID")
-HF_MODEL = os.getenv("HF_MODEL", "google/flan-t5-small")
+HF_MODEL = os.getenv("HF_MODEL", "google/flan-t5-small")  # small by default
 
 DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
 INDEX_FAISS = os.path.join(DATA_DIR, "index.faiss")
 INDEX_PKL = os.path.join(DATA_DIR, "index.pkl")
 
-# ------------- helper to download index quietly -------------
+# ---------- helper: quiet download from Google Drive ----------
 def download_from_gdrive_if_missing():
     try:
         if GDRIVE_INDEX_FAISS_ID and not os.path.exists(INDEX_FAISS):
@@ -41,7 +41,7 @@ def download_from_gdrive_if_missing():
     except Exception:
         pass
 
-# ------------- cached loaders -------------
+# ---------- cached model loaders ----------
 @st.cache_resource(show_spinner=False)
 def load_embed_model(name="all-MiniLM-L6-v2"):
     return SentenceTransformer(name)
@@ -81,20 +81,17 @@ def load_index_and_chunks():
     except Exception:
         return None, None
 
-# ------------- cleaning utilities -------------
-# remove weird encoding artifacts and boilerplate tokens
+# ---------- cleaning helpers ----------
 def fix_encoding(s: str) -> str:
     if not s:
         return ""
-    # replace garbage characters like Â
-    s = s.replace("Â", " ")
-    s = s.replace("\xa0", " ")
-    s = re.sub(r"[ \t]{2,}", " ", s)
+    s = s.replace("Â", " ").replace("\xa0", " ")
     s = s.replace("\r\n", "\n").replace("\r", "\n")
+    s = re.sub(r"\s{2,}", " ", s)
     s = re.sub(r"\n{3,}", "\n\n", s)
     return s.strip()
 
-BOILERPLATE_PATTERNS = ["©", "Privacy", "Terms", "Search", "Menu"]
+BOILERPLATE_PATTERNS = ["©", "Privacy", "Terms", "Search", "Menu", "Get Certified", "Sign In", "Try it Yourself"]
 BOILERPLATE_RE = re.compile("|".join([re.escape(p) for p in BOILERPLATE_PATTERNS]), re.IGNORECASE)
 
 def clean_text(s: str) -> str:
@@ -107,7 +104,7 @@ def clean_text(s: str) -> str:
     out = re.sub(r"\s{2,}", " ", out)
     return out.strip()
 
-# ------------- retrieval & QA -------------
+# ---------- retrieval & QA ----------
 embed_model = load_embed_model()
 extractive_qa = load_extractive_qa()
 summarizer = load_summarizer()
@@ -145,99 +142,127 @@ def extractive_candidates(hits, question, keep_top=8):
     cand = sorted(cand, key=lambda x: (-x["score"], x["dist"]))[:keep_top]
     return cand
 
-# ------------- smarter definition-finder -------------
-SENT_SPLIT_RE = re.compile(r'(?<=[\.\?\!])\s+')
-
-# map short user terms to likely canonical phrase to look for
+# ---------- canonicalization + curated fallbacks ----------
 CANONICAL_MAP = {
     "oop": "object oriented programming",
     "object oriented programming": "object oriented programming",
-    "object-oriented": "object oriented programming",
+    "object-oriented programming": "object oriented programming",
     "python": "python",
-    "list": "list",
-    "dictionary": "dictionary"
-    # add more if you like
 }
 
-def canonicalize_keyword(q: str) -> str:
+# safe curated background facts (used only as a fallback when site does not contain a clear definition).
+# You can edit/add entries — make them short factual statements.
+CURATED_FACTS = {
+    "python": (
+        "Python is a high-level, general-purpose programming language known for its simplicity and readability. "
+        "It was created by Guido van Rossum and first released in 1991."
+    ),
+    "object oriented programming": (
+        "Object-oriented programming (OOP) is a programming paradigm that uses 'objects'—data structures "
+        "containing data and methods—to design programs and model real-world entities."
+    ),
+}
+
+def canonicalize(q: str) -> str:
+    if not q:
+        return ""
     q0 = q.lower().strip()
     q0 = re.sub(r'[^a-z0-9\s\-]', ' ', q0)
     q0 = re.sub(r'\s+', ' ', q0).strip()
     return CANONICAL_MAP.get(q0, q0)
 
-def find_definition(hits, user_query, top_k_hits=8):
+# ---------- strong definition-finding (scoring sentences) ----------
+SENT_SPLIT_RE = re.compile(r'(?<=[\.\?\!])\s+')
+DEFINITION_VERBS = r"(?:\b(is|was|are|refers to|means|provides|represents|describes|allows|implements|supports)\b)"
+BOOST_TERMS = [
+    "programming language", "high-level", "object oriented", "object-oriented", "interpreted",
+    "general-purpose", "designed to", "used to", "allows you to", "provides"
+]
+
+def score_sentence(sentence: str, canonical_keyword: str, base_score: float=0.0, dist: float=1e6) -> float:
+    """Compute score for a candidate sentence. Higher = better."""
+    s = sentence.lower()
+    score = base_score
+    # presence of canonical keyword
+    if canonical_keyword and canonical_keyword in s:
+        score += 2.5
+    # strong definition pattern
+    if re.search(rf"\b{re.escape(canonical_keyword)}\b.*{DEFINITION_VERBS}", s) or re.search(rf"{DEFINITION_VERBS}.*\b{re.escape(canonical_keyword)}\b", s):
+        score += 4.0
+    # boost if contains boost terms
+    for t in BOOST_TERMS:
+        if t in s:
+            score += 1.5
+    # penalize very short sentences or lines that look like menus
+    if len(sentence.strip()) < 30:
+        score -= 2.0
+    # penalize uppercase-only lines (likely headings)
+    if sentence.strip().isupper():
+        score -= 2.0
+    # factor in distance (smaller dist = more relevant)
+    try:
+        score += (1.0 / (1.0 + dist)) * 2.0
+    except Exception:
+        pass
+    return score
+
+def find_best_definition(hits, user_query, top_k_hits=10):
     """
-    Attempt to find a clean one-sentence definition.
-    Strategy:
-      1) canonicalize query (e.g., 'oop' -> 'object oriented programming')
-      2) search top hits for sentences that contain the canonical phrase plus 'is|was|refers to|means|is a|are' etc.
-      3) prefer sentences from lower-distance hits
-      4) fallback: any sentence containing canonical phrase with length >= 30
+    Return (sentence, source) where sentence is the highest scoring candidate found in top hits.
     """
-    k = canonicalize_keyword(user_query)
-    if not k:
-        return None
-    # build regexes
-    verbs = r"(?:\b(is|was|are|refers to|means|provides|represents|describes|allows|supports)\b)"
-    # permissive pattern: phrase ... is/was ... (captures definitions)
-    pat1 = re.compile(rf".{{10,}}\b{re.escape(k)}\b.*?{verbs}.*?[\.!\?]", re.I)
-    pat2 = re.compile(rf".{{10,}}\b{re.escape(k)}\b.*?[\.!\?]", re.I)
-    # iterate hits prioritized by distance (smaller better)
-    hits_sorted = sorted(hits, key=lambda x: x[1])[:top_k_hits]
+    canonical = canonicalize(user_query)
+    candidates = []
+    hits_sorted = sorted(hits, key=lambda x: x[1])[:top_k_hits]  # prefer lower distance
     for h, dist in hits_sorted:
         text = clean_text(h.get("text",""))
         if not text:
             continue
-        # split sentences
         sents = SENT_SPLIT_RE.split(text)
         for s in sents:
-            s_clean = s.strip()
-            if len(s_clean) < 30:
+            if not s or len(s.strip()) < 20:
                 continue
-            if pat1.search(s_clean):
-                # returned sentence
-                one = s_clean
-                if not re.search(r'[.!?]$', one):
-                    one += '.'
-                one = re.sub(r'\s{2,}', ' ', one).strip()
-                return one, h.get("url","")
-    # fallback: any sentence with the canonical phrase
-    for h, dist in hits_sorted:
-        text = clean_text(h.get("text",""))
-        if not text:
-            continue
-        sents = SENT_SPLIT_RE.split(text)
-        for s in sents:
-            if k in s.lower() and len(s.strip()) >= 30:
-                one = s.strip()
-                if not re.search(r'[.!?]$', one):
-                    one += '.'
-                return re.sub(r'\s{2,}', ' ', one).strip(), h.get("url","")
-    return None, None
+            # skip lines that look like nav/menu (few words and uppercase)
+            if len(s.strip().split()) <= 4 and s.strip().isupper():
+                continue
+            base = 0.0
+            # if this sentence appears in extractive candidate we can later incorporate base score (not available here)
+            sc = score_sentence(s, canonical_keyword=canonical, base_score=base, dist=dist)
+            if sc > -1.5:  # weak filter
+                candidates.append({"sent": s.strip(), "score": sc, "source": h.get("url","")})
+    if not candidates:
+        return None, None
+    # sort and return top
+    best = sorted(candidates, key=lambda x: -x["score"])[0]
+    s = best["sent"]
+    # ensure punctuation at end
+    if not re.search(r'[.!?]$', s):
+        s = s + '.'
+    # cleanup whitespace
+    s = re.sub(r'\s{2,}', ' ', s).strip()
+    return s, best.get("source")
 
-# ------------- concise/expanded flows -------------
+# ---------- concise + expanded answer logic ----------
 def get_concise_answer(question, hits, candidates):
-    # 1) try definition finder
-    def_sent, src = find_definition(hits, question, top_k_hits=8)
-    if def_sent:
-        return def_sent, src
+    # 1) try best definition from indexed chunks
+    sent, src = find_best_definition(hits, question, top_k_hits=10)
+    if sent:
+        return sent, src
 
-    # 2) best extractive candidate
+    # 2) pick best extractive candidate (if any)
     if candidates:
-        best = candidates[0]
-        one = best.get("answer","").strip()
+        top = candidates[0]
+        one = top.get("answer","").strip()
         one = re.sub(r'(\b\w+\b)(?:\s+\1\b){2,}', r'\1', one)
         if not re.search(r'[.!?]$', one):
             one += '.'
-        return one, best.get("source","")
+        return one, top.get("source","")
 
-    # 3) summarizer fallback
+    # 3) summarizer fallback over top hits
     if summarizer and hits:
         texts = []
         for h, d in hits[:3]:
             t = clean_text(h.get("text",""))
-            if t:
-                texts.append(t)
+            if t: texts.append(t)
         joined = "\n\n".join(texts)
         if joined and len(joined) > 120:
             try:
@@ -250,62 +275,98 @@ def get_concise_answer(question, hits, candidates):
             except Exception:
                 pass
 
+    # 4) curated fallback if canonical present
+    canonical = canonicalize(question)
+    if canonical in CURATED_FACTS:
+        return CURATED_FACTS[canonical], "general knowledge"
+
+    # 5) generator fallback: ask generator to produce a 1-line definition from top candidates (last resort)
+    if generator and candidates:
+        facts = []
+        used = set()
+        for c in candidates[:6]:
+            a = c.get("answer","").strip()
+            key = re.sub(r'\s+', ' ', a.lower()).strip()
+            if not key or key in used: continue
+            used.add(key)
+            facts.append("- " + a)
+        if facts:
+            prompt = (
+                "Using ONLY the facts below, write one short definition (one sentence) for the requested term. "
+                "If facts are insufficient, say 'I couldn't find this in the site data.'\n\n"
+                "Facts:\n" + "\n".join(facts) + "\n\nDefinition:"
+            )
+            try:
+                out = generator(prompt, max_length=80, do_sample=False)
+                gen = out[0].get("generated_text","").strip()
+                if gen:
+                    first_line = gen.splitlines()[0].strip()
+                    if not re.search(r'[.!?]$', first_line):
+                        first_line += '.'
+                    return first_line, None
+            except Exception:
+                pass
+
     return None, None
 
 def synthesize_expanded(question, candidates):
+    """Generate a fuller answer using the generator (friendly multi-part)."""
     if not candidates or generator is None:
         return None, []
     facts = []
     sources = []
     used = set()
-    for c in candidates[:6]:
+    for c in candidates[:8]:
         a = c.get("answer","").strip()
-        key = re.sub(r'\s+', ' ', a.lower()).strip()
-        if not key or key in used: continue
-        used.add(key)
+        k = re.sub(r'\s+', ' ', a.lower()).strip()
+        if not k or k in used: continue
+        used.add(k)
         facts.append("- " + a)
         s = c.get("source")
-        if s and s not in sources: sources.append(s)
+        if s and s not in sources:
+            sources.append(s)
     if not facts:
         return None, []
     prompt = (
-        "You are a helpful assistant. Using ONLY the facts below, write a friendly concise answer: "
-        "1) one-line definition; 2) three short bullets 'what makes it special'; 3) three short bullets 'what you can build'; "
+        "You are a helpful assistant. Using ONLY the facts below, write a friendly concise answer structured as:\n"
+        "1) One-line definition; 2) three short bullets 'what makes it special'; 3) three short bullets 'what you can build'; "
         "4) a tiny python example (if relevant).\n\n"
         f"Question: {question}\n\nFacts:\n" + "\n".join(facts) + "\n\nAnswer:"
     )
     try:
-        out = generator(prompt, max_length=300, do_sample=False)
+        out = generator(prompt, max_length=320, do_sample=False)
         text = out[0].get("generated_text","").strip()
         text = re.sub(r'\s{2,}', ' ', text)
         return text, sources[:2]
     except Exception:
         return None, sources[:2]
 
-# ------------- Streamlit UI (minimal) -------------
+# ---------- Streamlit UI (minimal) ----------
 st.set_page_config(page_title="Python Tutorial Chatbot", layout="centered")
 st.title("🐍 Python Tutorial Chatbot")
 
+# try to download index from Drive if IDs provided (quiet)
 download_from_gdrive_if_missing()
 INDEX, CHUNKS = load_index_and_chunks()
 
 if INDEX is None or CHUNKS is None:
-    st.error("Index not available. Run embed_index.py locally and upload data/index.faiss & data/index.pkl or set GDRIVE vars.")
+    st.error("Index files missing. Run embed_index.py locally, upload data/index.faiss and data/index.pkl, or set GDRIVE_INDEX_FAISS_ID & GDRIVE_INDEX_PKL_ID.")
     st.stop()
 
-q = st.text_input("Ask a question about the Python tutorial:", "")
-if st.button("Ask") and q.strip():
+query = st.text_input("Ask a question about the Python tutorial:", "")
+if st.button("Ask") and query.strip():
     with st.spinner("Searching..."):
-        hits = search_index(INDEX, CHUNKS, q, k=10)
-        candidates = extractive_candidates(hits, q, keep_top=8)
-        concise, source = get_concise_answer(q, hits, candidates)
+        hits = search_index(INDEX, CHUNKS, query, k=10)
+        candidates = extractive_candidates(hits, query, keep_top=8)
+        concise, source = get_concise_answer(query, hits, candidates)
         if concise:
             st.markdown("### Answer")
             st.write(concise)
             if source:
-                st.markdown(f"**Source:** [{source}]({source})")
+                st.markdown(f"**Source:** {source}" if source == "general knowledge" else f"**Source:** [{source}]({source})")
+            # expand button
             if st.button("Show expanded answer"):
-                expanded, sources = synthesize_expanded(q, candidates)
+                expanded, sources = synthesize_expanded(query, candidates)
                 if expanded:
                     st.markdown("### Expanded Answer")
                     st.write(expanded)
