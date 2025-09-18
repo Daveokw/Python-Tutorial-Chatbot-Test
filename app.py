@@ -1,4 +1,4 @@
-# app.py
+# app.py (updated)
 import os
 import re
 import pickle
@@ -10,14 +10,19 @@ import streamlit as st
 from sentence_transformers import SentenceTransformer
 from transformers import pipeline
 from dotenv import load_dotenv
-import trafilatura
+
+# Make trafilatura optional (cloud-friendly)
+try:
+    import trafilatura
+except Exception:
+    trafilatura = None
 
 load_dotenv()
 GDRIVE_INDEX_FAISS_ID = os.getenv("GDRIVE_INDEX_FAISS_ID")
 GDRIVE_INDEX_PKL_ID = os.getenv("GDRIVE_INDEX_PKL_ID")
-GDRIVE_CHUNKS_PKL_ID = os.getenv("GDRIVE_CHUNKS_ID")
+GDRIVE_CHUNKS_PKL_ID = os.getenv("GDRIVE_CHUNKS_ID")  # optional
 
-HF_MODEL = os.getenv("HF_MODEL", "google/flan-t5-base")  # set to "-small" if limited
+HF_MODEL = os.getenv("HF_MODEL", "google/flan-t5-small")  # default small for cloud-safety
 
 DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -82,8 +87,8 @@ BOILERPLATE_PATTERNS = [
     r"\bGet Certified\b", r"\bSign In\b", r"\bTryit Editor\b", r"\bSearch\b",
     r"\bSpaces\b", r"\bMenu\b", r"\bAbout\b", r"\bContact\b", r"\bSubscribe\b",
     r"W3Schools", r"©", r"Privacy", r"Terms", r"Home\b", r"Next\b", r"Prev\b",
-    r"Advertisement", r"©\s*\d{4}", r"Table of Contents", r"Contents", r"Jump to", r"Related Topics",
-    r"Previous", r"Next", r"Skip to content", r"Show more", r"Log in", r"Sign up", r"Try it Yourself"
+    r"Advertisement", r"©\s*\d{4}", r"Table of Contents", r"Contents", r"Jump to",
+    r"Related Topics", r"Try it Yourself", r"Get Certified", r"Sign In"
 ]
 BOILERPLATE_RE = re.compile("|".join(BOILERPLATE_PATTERNS), re.IGNORECASE)
 
@@ -105,13 +110,13 @@ def clean_text(s: str) -> str:
     out = re.sub(r"\s{2,}", " ", out)
     return out.strip()
 
-# ---------------- Search & QA pipeline ----------------
+# ---------------- Search & QA flow ----------------
 embed_model = load_embed_model()
 extractive_qa = load_extractive_qa()
 summarizer = load_summarizer()
 gen_pipeline = load_gen_pipeline()
 
-def search_index(idx, chunks, question, k=8):
+def search_index(idx, chunks, question, k=6):
     qv = embed_model.encode([question], convert_to_numpy=True).astype("float32")
     D, I = idx.search(qv, k)
     results = []
@@ -120,15 +125,19 @@ def search_index(idx, chunks, question, k=8):
             results.append((chunks[idx_i], float(dist)))
     return results
 
-# improved dedupe helpers
+# improved dedupe + pick best candidate
 def normalize_answer(a: str) -> str:
     s = re.sub(r'\s+', ' ', a.strip().lower())
     s = re.sub(r'^[^a-z0-9]+|[^a-z0-9]+$', '', s)
     return s
 
-def pick_best_variant(candidates_list):
+def pick_best_candidate(candidates):
+    # prefer higher score, then longer context then lower distance
+    if not candidates:
+        return None
+    # dedupe by normalized answer keeping best variant
     best = {}
-    for c in candidates_list:
+    for c in candidates:
         key = normalize_answer(c["answer"])
         if not key:
             continue
@@ -136,13 +145,13 @@ def pick_best_variant(candidates_list):
         if not prev:
             best[key] = c
         else:
-            if (c["score"] > prev["score"] + 1e-6) or (len(c.get("text","")) > len(prev.get("text","")) and c["score"] >= prev["score"] - 1e-6):
+            if c["score"] > prev["score"] + 1e-6 or (len(c.get("text","")) > len(prev.get("text","")) and c["score"] >= prev["score"] - 1e-6):
                 best[key] = c
-    out = sorted(best.values(), key=lambda x: (-x["score"], x["dist"]))
-    return out
+    unique = sorted(best.values(), key=lambda x: (-x["score"], x["dist"]))
+    return unique[0] if unique else None
 
-def extract_answers_from_hits(hits_with_dist, question, keep_top=8):
-    raw_candidates = []
+def extract_candidates(hits_with_dist, question, keep_top=8):
+    cand = []
     for h, dist in hits_with_dist:
         text = clean_text(h.get("text",""))
         if not text or len(text) < 60:
@@ -152,7 +161,7 @@ def extract_answers_from_hits(hits_with_dist, question, keep_top=8):
             score = float(res.get("score", 0.0))
             ans = res.get("answer","").strip()
             if ans:
-                raw_candidates.append({
+                cand.append({
                     "answer": ans,
                     "score": score,
                     "source": h.get("url",""),
@@ -161,10 +170,7 @@ def extract_answers_from_hits(hits_with_dist, question, keep_top=8):
                 })
         except Exception:
             continue
-    if not raw_candidates:
-        return []
-    unique = pick_best_variant(raw_candidates)
-    return unique[:keep_top]
+    return sorted(cand, key=lambda x: (-x["score"], x["dist"]))[:keep_top]
 
 def fallback_summarize_top_chunks(candidates_or_hits):
     if summarizer is None:
@@ -184,86 +190,73 @@ def fallback_summarize_top_chunks(candidates_or_hits):
     except Exception:
         return None
 
-def synthesize_answer_rich(question, candidates, max_len=420):
-    """
-    Build a structured prompt that asks the generator to expand and produce
-    a friendly, informative answer. Allows a small set of safe background facts
-    for programming languages (creator, release year).
-    Returns (answer_text, top_sources)
-    """
+# concise default answer (direct)
+def get_concise_answer(question, candidates):
+    # pick best candidate and return single-line cleaned answer
+    best = pick_best_candidate(candidates)
+    if best:
+        one = best["answer"].strip()
+        # clean up repeated words/patterns (simple heuristic)
+        one = re.sub(r'(\b\w+\b)(?:\s+\1\b){2,}', r'\1', one)
+        # ensure ends with period
+        if not re.search(r'[.!?]$', one):
+            one = one + '.'
+        return one, best.get("source", "")
+    return None, ""
+
+# expanded answer via generator (only when user requests)
+def synthesize_expanded(question, candidates, max_len=280):
     if not candidates:
         return None, []
-
-    # build short deduped facts (prefer variants that are longer / higher score)
+    # produce compact fact list (deduped)
     facts = []
     sources = []
+    used = set()
     for c in candidates[:6]:
         a = c.get("answer","").strip()
-        if not a or len(a) < 8:
+        key = normalize_answer(a)
+        if not key or key in used:
             continue
-        facts.append(f"- {a}")
-        src = c.get("source")
-        if src and src not in sources:
-            sources.append(src)
-    # fallback: if facts are extremely short, use summarizer on top texts
+        used.add(key)
+        if len(a) >= 8:
+            facts.append(f"- {a}")
+            s = c.get("source")
+            if s and s not in sources:
+                sources.append(s)
+    # if facts minimal length, use summarizer fallback
     if sum(len(f) for f in facts) < 60:
-        summ = None
-        try:
-            if summarizer:
-                # summarizer expects a single long text
-                joined = "\n\n".join([c.get("text","") for c in candidates[:3]])
-                if joined and len(joined) > 200:
-                    out = summarizer(joined, max_length=140, min_length=60, do_sample=False)
-                    summ = out[0].get("summary_text","").strip()
-        except Exception:
-            summ = None
+        summ = fallback_summarize_top_chunks(candidates)
         if summ:
             facts = [f"- {summ}"]
-
     if not facts:
-        return None, sources[:2]
-
+        return None, []
     facts_block = "\n".join(facts)
-
-    # Add a short knowledge whitelist for safe background facts for 'python'
-    background_guidance = (
-        "You may add only very small, widely-known background facts such as the creator and first release year "
-        "for programming languages (for example: 'Python was created by Guido van Rossum and first released in 1991'). "
-        "Do NOT invent other facts or details not implied by the facts below."
-    )
-
     prompt = (
-        "You are a helpful, friendly AI tutor. Use ONLY the facts below as your main source. "
-        + background_guidance
-        + " Produce a clear answer with this structure:\n\n"
-        "1) One-line definition/summary.\n"
-        "2) 'What makes it special?' (3 bullets)\n"
-        "3) 'What can you build?' (3 bullets)\n"
-        "4) A tiny example in ```python``` if relevant (1-4 lines).\n"
-        "5) One encouraging closing sentence.\n\n"
+        "You are a helpful assistant. Use ONLY the facts below as your main source. "
+        "You MAY add very small widely-known background facts (creator/release year) for programming languages if appropriate. "
+        "Write a concise, friendly explanation structured as: 1) One-line definition; 2) 3 bullets: what makes it special; 3) 3 bullets: what you can build; 4) a tiny python example (1-3 lines); 5) one closing encouragement.\n\n"
         f"Question: {question}\n\nFacts:\n{facts_block}\n\nAnswer:"
     )
-
     try:
         out = gen_pipeline(prompt, max_length=max_len, do_sample=False)
-        text = out[0].get("generated_text","").strip()
-        text = re.sub(r"\s{2,}", " ", text).strip()
-        return text, sources[:2]
+        gen = out[0].get("generated_text") or out[0].get("summary_text") or ""
+        gen = gen.strip()
+        gen = re.sub(r'\s{2,}', ' ', gen)
+        return gen, sources[:2]
     except Exception:
         return None, sources[:2]
 
 # ---------------- URL-on-demand QA ----------------
 def fetch_main_from_url(url):
-    """Fetch page and extract main content via trafilatura (fallback to basic text)."""
     try:
-        r = requests.get(url, timeout=15, headers={"User-Agent": "site-qa-bot/1.0"})
+        r = requests.get(url, timeout=15, headers={"User-Agent":"site-qa-bot/1.0"})
         r.raise_for_status()
         html = r.text
-        main = trafilatura.extract(html)
-        if main and len(main.strip()) > 50:
-            # include code blocks from HTML as well
-            return main
-        # fallback: simple soup extraction without soup import-heavy logic to keep deps small
+        if trafilatura:
+            main = trafilatura.extract(html)
+            if main and len(main.strip()) > 50:
+                return main
+        # fallback to simple extraction
         from bs4 import BeautifulSoup
         soup = BeautifulSoup(html, "html.parser")
         text = soup.get_text(separator="\n")
@@ -272,23 +265,19 @@ def fetch_main_from_url(url):
         return None
 
 def fetch_and_answer_url(url, question):
-    """Fetch a single URL and answer the question from its content."""
     text = fetch_main_from_url(url)
     if not text or len(text.strip()) < 80:
         return None, []
     clean = clean_text(text)
-    # try extractive QA directly on the page
     try:
         res = extractive_qa(question=question, context=clean)
         ans = res.get("answer","").strip()
-        score = float(res.get("score", 0.0))
-        # if score is reasonably high, synthesize a structured answer that includes this fact
+        score = float(res.get("score",0.0))
         if ans and score >= 0.05:
-            # create a pseudo-candidate
             cand = [{"answer": ans, "score": score, "source": url, "text": clean, "dist": 0.0}]
-            out, sources = synthesize_answer_rich(question, cand, max_len=320)
-            return out, sources
-        # else fallback to summarizer over the whole page then synthesize
+            concise, src = get_concise_answer(question, cand)
+            return concise, [src] if src else []
+        # fallback summarizer
         summ = None
         if summarizer:
             try:
@@ -298,8 +287,8 @@ def fetch_and_answer_url(url, question):
                 summ = None
         if summ:
             cand = [{"answer": summ, "score": 0.01, "source": url, "text": clean, "dist": 0.0}]
-            out, sources = synthesize_answer_rich(question, cand, max_len=320)
-            return out, sources
+            concise, src = get_concise_answer(question, cand)
+            return concise, [src] if src else []
     except Exception:
         pass
     return None, []
@@ -317,53 +306,59 @@ if INDEX is None or CHUNKS is None:
 
 show_dev = st.checkbox("Developer: show candidates & raw chunks", value=False)
 
-# Optional URL field (if provided, answer directly from the URL)
-url_input = st.text_input("Optional: Enter a specific URL to answer from (leave blank to use site index):", value="", key="url_input")
+url_input = st.text_input("Optional: specific URL (leave blank to use index):", value="", key="url_input")
 query = st.text_input("Ask a question about W3Schools Python:", value="", key="query_input")
 ask = st.button("Ask")
 
 if ask and query.strip():
     with st.spinner("Thinking..."):
+        # If URL provided, answer directly from page
         if url_input.strip():
-            answer, sources = fetch_and_answer_url(url_input.strip(), query)
-            if answer:
-                if "couldn't find" in answer.lower():
-                    st.info("I couldn't find this in the page data.")
-                else:
-                    st.markdown("### 🧠 Answer (from provided URL)")
-                    st.markdown(answer)
-                    if sources:
-                        st.markdown("**Sources:** " + ", ".join(f"[{s}]({s})" for s in sources))
+            concise, sources = fetch_and_answer_url(url_input.strip(), query)
+            if concise:
+                st.markdown("### 🧠 Answer (from provided URL)")
+                st.write(concise)
+                if sources:
+                    st.markdown("**Sources:** " + ", ".join(f"[{s}]({s})" for s in sources))
             else:
                 st.info("No confident answer found on that page.")
+            continue
+
+        # Otherwise use index retrieval
+        hits = search_index(INDEX, CHUNKS, query, k=8)
+        candidates = extract_candidates(hits, query, keep_top=8)
+
+        # Developer view
+        if show_dev:
+            st.subheader("Candidates (dev)")
+            st.write(candidates)
+            st.subheader("Top raw chunks (dev)")
+            for h, d in hits[:4]:
+                st.write(h.get("url",""))
+                st.write(h.get("text","")[:400] + ("..." if len(h.get("text",""))>400 else ""))
+
+        # default concise answer
+        concise, top_src = get_concise_answer(query, candidates)
+        if concise:
+            st.markdown("### 🧠 Answer")
+            st.write(concise)
+            if top_src:
+                st.markdown("**Source:** " + f"[{top_src}]({top_src})")
+            # show button to expand
+            if st.button("Show expanded answer"):
+                expanded, sources = synthesize_expanded(query, candidates, max_len=420)
+                if expanded:
+                    st.markdown("### 🧾 Expanded Answer")
+                    st.markdown(expanded)
+                    if sources:
+                        st.markdown("**Sources:** " + ", ".join(f"[{s}]({s})" for s in sources))
+                else:
+                    st.info("No expanded answer could be generated.")
         else:
-            try:
-                hits = search_index(INDEX, CHUNKS, query, k=10)
-                candidates = extract_answers_from_hits(hits, query, keep_top=8)
-                answer, top_sources = None, []
-                if candidates:
-                    answer, top_sources = synthesize_answer_rich(query, candidates, max_len=420)
-                else:
-                    raw_summ = fallback_summarize_top_chunks(hits)
-                    if raw_summ:
-                        pseudo = [{"answer": raw_summ, "score": 0.01, "source": ""}]
-                        answer, top_sources = synthesize_answer_rich(query, pseudo, max_len=420)
-                if show_dev:
-                    st.subheader("Candidates (dev)")
-                    st.write(candidates)
-                    st.subheader("Top raw chunks (dev)")
-                    for h, d in hits[:4]:
-                        st.write(h.get("url",""))
-                        st.write(h.get("text","")[:400] + ("..." if len(h.get("text",""))>400 else ""))
-                if answer:
-                    if "couldn't find" in answer.lower():
-                        st.info("I couldn't find this in the site data.")
-                    else:
-                        st.markdown("### 🧠 Answer")
-                        st.markdown(answer)
-                        if top_sources:
-                            st.markdown("**Sources:** " + ", ".join(f"[{s}]({s})" for s in top_sources))
-                else:
-                    st.info("I couldn't find a confident answer in the indexed content.")
-            except Exception:
-                st.error("An error occurred. Please try again.")
+            # fallback: summarizer of top chunks
+            raw_summ = fallback_summarize_top_chunks(hits)
+            if raw_summ:
+                st.markdown("### 🧠 Answer (fallback summarization)")
+                st.write(raw_summ)
+            else:
+                st.info("I couldn't find a confident answer in the indexed content.")
