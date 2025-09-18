@@ -1,4 +1,4 @@
-# app.py (updated)
+# app.py (fixed)
 import os
 import re
 import pickle
@@ -52,6 +52,7 @@ def load_embed_model(name="all-MiniLM-L6-v2"):
 
 @st.cache_resource(show_spinner=False)
 def load_extractive_qa():
+    # DistilBERT-based QA pipeline (CPU safe)
     return pipeline("question-answering", model="distilbert-base-cased-distilled-squad", device=-1)
 
 @st.cache_resource(show_spinner=False)
@@ -132,10 +133,8 @@ def normalize_answer(a: str) -> str:
     return s
 
 def pick_best_candidate(candidates):
-    # prefer higher score, then longer context then lower distance
     if not candidates:
         return None
-    # dedupe by normalized answer keeping best variant
     best = {}
     for c in candidates:
         key = normalize_answer(c["answer"])
@@ -192,13 +191,10 @@ def fallback_summarize_top_chunks(candidates_or_hits):
 
 # concise default answer (direct)
 def get_concise_answer(question, candidates):
-    # pick best candidate and return single-line cleaned answer
     best = pick_best_candidate(candidates)
     if best:
         one = best["answer"].strip()
-        # clean up repeated words/patterns (simple heuristic)
-        one = re.sub(r'(\b\w+\b)(?:\s+\1\b){2,}', r'\1', one)
-        # ensure ends with period
+        one = re.sub(r'(\b\w+\b)(?:\s+\1\b){2,}', r'\1', one)  # simple de-dup
         if not re.search(r'[.!?]$', one):
             one = one + '.'
         return one, best.get("source", "")
@@ -208,7 +204,6 @@ def get_concise_answer(question, candidates):
 def synthesize_expanded(question, candidates, max_len=280):
     if not candidates:
         return None, []
-    # produce compact fact list (deduped)
     facts = []
     sources = []
     used = set()
@@ -223,7 +218,6 @@ def synthesize_expanded(question, candidates, max_len=280):
             s = c.get("source")
             if s and s not in sources:
                 sources.append(s)
-    # if facts minimal length, use summarizer fallback
     if sum(len(f) for f in facts) < 60:
         summ = fallback_summarize_top_chunks(candidates)
         if summ:
@@ -256,7 +250,6 @@ def fetch_main_from_url(url):
             main = trafilatura.extract(html)
             if main and len(main.strip()) > 50:
                 return main
-        # fallback to simple extraction
         from bs4 import BeautifulSoup
         soup = BeautifulSoup(html, "html.parser")
         text = soup.get_text(separator="\n")
@@ -277,7 +270,6 @@ def fetch_and_answer_url(url, question):
             cand = [{"answer": ans, "score": score, "source": url, "text": clean, "dist": 0.0}]
             concise, src = get_concise_answer(question, cand)
             return concise, [src] if src else []
-        # fallback summarizer
         summ = None
         if summarizer:
             try:
@@ -312,7 +304,7 @@ ask = st.button("Ask")
 
 if ask and query.strip():
     with st.spinner("Thinking..."):
-        # If URL provided, answer directly from page
+        # URL branch (direct answer from page)
         if url_input.strip():
             concise, sources = fetch_and_answer_url(url_input.strip(), query)
             if concise:
@@ -322,43 +314,41 @@ if ask and query.strip():
                     st.markdown("**Sources:** " + ", ".join(f"[{s}]({s})" for s in sources))
             else:
                 st.info("No confident answer found on that page.")
-            continue
-
-        # Otherwise use index retrieval
-        hits = search_index(INDEX, CHUNKS, query, k=8)
-        candidates = extract_candidates(hits, query, keep_top=8)
-
-        # Developer view
-        if show_dev:
-            st.subheader("Candidates (dev)")
-            st.write(candidates)
-            st.subheader("Top raw chunks (dev)")
-            for h, d in hits[:4]:
-                st.write(h.get("url",""))
-                st.write(h.get("text","")[:400] + ("..." if len(h.get("text",""))>400 else ""))
-
-        # default concise answer
-        concise, top_src = get_concise_answer(query, candidates)
-        if concise:
-            st.markdown("### 🧠 Answer")
-            st.write(concise)
-            if top_src:
-                st.markdown("**Source:** " + f"[{top_src}]({top_src})")
-            # show button to expand
-            if st.button("Show expanded answer"):
-                expanded, sources = synthesize_expanded(query, candidates, max_len=420)
-                if expanded:
-                    st.markdown("### 🧾 Expanded Answer")
-                    st.markdown(expanded)
-                    if sources:
-                        st.markdown("**Sources:** " + ", ".join(f"[{s}]({s})" for s in sources))
-                else:
-                    st.info("No expanded answer could be generated.")
         else:
-            # fallback: summarizer of top chunks
-            raw_summ = fallback_summarize_top_chunks(hits)
-            if raw_summ:
-                st.markdown("### 🧠 Answer (fallback summarization)")
-                st.write(raw_summ)
+            # Index retrieval branch
+            hits = search_index(INDEX, CHUNKS, query, k=8)
+            candidates = extract_candidates(hits, query, keep_top=8)
+
+            # Developer view
+            if show_dev:
+                st.subheader("Candidates (dev)")
+                st.write(candidates)
+                st.subheader("Top raw chunks (dev)")
+                for h, d in hits[:4]:
+                    st.write(h.get("url",""))
+                    st.write(h.get("text","")[:400] + ("..." if len(h.get("text",""))>400 else ""))
+
+            # default concise answer
+            concise, top_src = get_concise_answer(query, candidates)
+            if concise:
+                st.markdown("### 🧠 Answer")
+                st.write(concise)
+                if top_src:
+                    st.markdown("**Source:** " + f"[{top_src}]({top_src})")
+                # show button to expand
+                if st.button("Show expanded answer"):
+                    expanded, sources = synthesize_expanded(query, candidates, max_len=420)
+                    if expanded:
+                        st.markdown("### 🧾 Expanded Answer")
+                        st.markdown(expanded)
+                        if sources:
+                            st.markdown("**Sources:** " + ", ".join(f"[{s}]({s})" for s in sources))
+                    else:
+                        st.info("No expanded answer could be generated.")
             else:
-                st.info("I couldn't find a confident answer in the indexed content.")
+                raw_summ = fallback_summarize_top_chunks(hits)
+                if raw_summ:
+                    st.markdown("### 🧠 Answer (fallback summarization)")
+                    st.write(raw_summ)
+                else:
+                    st.info("I couldn't find a confident answer in the indexed content.")
